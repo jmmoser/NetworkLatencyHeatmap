@@ -2,9 +2,85 @@ const std = @import("std");
 const posix = std.posix;
 const net = std.net;
 const c = std.c;
+const builtin = @import("builtin");
 
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
+
+// Platform-agnostic event poller for socket readiness
+const SocketPoller = struct {
+    // Use kqueue on macOS/BSD, epoll on Linux
+    const is_darwin = builtin.os.tag == .macos or builtin.os.tag == .ios or
+        builtin.os.tag == .watchos or builtin.os.tag == .tvos or
+        builtin.os.tag == .freebsd or builtin.os.tag == .netbsd or
+        builtin.os.tag == .openbsd or builtin.os.tag == .dragonfly;
+
+    const is_linux = builtin.os.tag == .linux;
+
+    fd: posix.fd_t,
+    sock: posix.fd_t,
+
+    pub fn init(sock: posix.fd_t) !SocketPoller {
+        if (is_darwin) {
+            const kq = try posix.kqueue();
+            // Register socket for read events
+            var changelist = [_]posix.Kevent{.{
+                .ident = @intCast(sock),
+                .filter = posix.system.EVFILT.READ,
+                .flags = posix.system.EV.ADD,
+                .fflags = 0,
+                .data = 0,
+                .udata = 0,
+            }};
+            _ = try posix.kevent(kq, &changelist, &[_]posix.Kevent{}, null);
+            return .{ .fd = kq, .sock = sock };
+        } else if (is_linux) {
+            const epfd = try posix.epoll_create1(0);
+            var ev = posix.linux.epoll_event{
+                .events = posix.linux.EPOLL.IN,
+                .data = .{ .fd = sock },
+            };
+            try posix.epoll_ctl(epfd, posix.linux.EPOLL.CTL_ADD, sock, &ev);
+            return .{ .fd = epfd, .sock = sock };
+        } else {
+            // Fallback: no event fd, will use polling
+            return .{ .fd = -1, .sock = sock };
+        }
+    }
+
+    pub fn deinit(self: *SocketPoller) void {
+        if (self.fd >= 0) {
+            posix.close(self.fd);
+        }
+    }
+
+    // Wait for socket to be readable, returns true if data available, false on timeout
+    // timeout_ms: max time to wait in milliseconds
+    pub fn wait(self: *SocketPoller, timeout_ms: u32) bool {
+        if (is_darwin) {
+            const timeout = posix.timespec{
+                .sec = @intCast(timeout_ms / 1000),
+                .nsec = @intCast((timeout_ms % 1000) * 1_000_000),
+            };
+            var events: [1]posix.Kevent = undefined;
+            const n = posix.kevent(self.fd, &[_]posix.Kevent{}, &events, &timeout) catch return false;
+            return n > 0;
+        } else if (is_linux) {
+            var events: [1]posix.linux.epoll_event = undefined;
+            const n = posix.epoll_wait(self.fd, &events, @intCast(timeout_ms)) catch return false;
+            return n > 0;
+        } else {
+            // Fallback: simple sleep-based polling
+            std.Thread.sleep(timeout_ms * std.time.ns_per_ms);
+            return true; // Assume data might be available
+        }
+    }
+
+    // Non-blocking check if data is available (timeout = 0)
+    pub fn poll(self: *SocketPoller) bool {
+        return self.wait(0);
+    }
+};
 
 const IcmpHeader = extern struct {
     type: u8,
@@ -427,6 +503,7 @@ fn senderThread(state: *ScanState) void {
 // Two-phase scanner using threads
 const Scanner = struct {
     sock: posix.fd_t,
+    poller: SocketPoller,
     allocator: std.mem.Allocator,
     all_ips: []const [4]u8,
     config: Config,
@@ -453,8 +530,12 @@ const Scanner = struct {
         const flags = try posix.fcntl(sock, posix.F.GETFL, 0);
         _ = try posix.fcntl(sock, posix.F.SETFL, flags | @as(usize, posix.SOCK.NONBLOCK));
 
+        // Create event poller for efficient socket waiting
+        const poller = try SocketPoller.init(sock);
+
         return Scanner{
             .sock = sock,
+            .poller = poller,
             .allocator = allocator,
             .all_ips = all_ips,
             .config = config,
@@ -463,6 +544,7 @@ const Scanner = struct {
     }
 
     pub fn deinit(self: *Scanner) void {
+        self.poller.deinit();
         posix.close(self.sock);
     }
 
@@ -557,7 +639,9 @@ const Scanner = struct {
             if (recv_rc < 0) {
                 const err = std.c._errno().*;
                 if (err == 35) { // EAGAIN/EWOULDBLOCK on macOS
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    // Use event-driven wait instead of polling
+                    // Wait up to 10ms for data, allows progress updates
+                    _ = self.poller.wait(10);
                     continue;
                 }
                 continue; // Other errors
@@ -697,7 +781,9 @@ const Scanner = struct {
             if (recv_rc < 0) {
                 const err = std.c._errno().*;
                 if (err == 35) { // EAGAIN/EWOULDBLOCK on macOS
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    // Use event-driven wait instead of polling
+                    // Wait up to 10ms for data, allows progress updates
+                    _ = self.poller.wait(10);
                     continue;
                 }
                 continue;
