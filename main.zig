@@ -612,6 +612,7 @@ fn generateIpRange(allocator: std.mem.Allocator, subnet: [4]u8, mask_bits: u8) !
 
 fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: usize) void {
     const reset = "\x1b[0m";
+    const col_width = 18; // Fixed column width for alignment
 
     stdout.print("\n", .{}) catch {};
 
@@ -623,17 +624,29 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
         for (results[row_start..row_end]) |r| {
             var buf: [16]u8 = undefined;
             const ip_str = ipToString(r.ip, &buf);
-            stdout.print("{s:<16}", .{ip_str}) catch {};
+            // Pad IP string to fixed column width
+            stdout.print("{s}", .{ip_str}) catch {};
+            const padding = col_width - ip_str.len;
+            for (0..padding) |_| {
+                stdout.print(" ", .{}) catch {};
+            }
         }
         stdout.print("\n", .{}) catch {};
 
-        // Print heatmap blocks
+        // Print heatmap blocks with latency
         for (results[row_start..row_end]) |r| {
             const color = latencyToColor(r.latency_us);
             const block = latencyToBlock(r.latency_us);
             var lat_buf: [16]u8 = undefined;
             const lat_str = formatLatency(r.latency_us, &lat_buf);
-            stdout.print("{s}{s} {s:<10}{s}  ", .{ color, block, lat_str, reset }) catch {};
+            // Block + space + latency, then pad to column width
+            stdout.print("{s}{s} {s}{s}", .{ color, block, lat_str, reset }) catch {};
+            // 2 chars for block+space, plus latency length
+            const used = 2 + lat_str.len;
+            const padding = col_width - used;
+            for (0..padding) |_| {
+                stdout.print(" ", .{}) catch {};
+            }
         }
         stdout.print("\n\n", .{}) catch {};
 

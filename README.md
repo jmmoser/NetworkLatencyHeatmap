@@ -87,7 +87,7 @@ sudo ./zig-out/bin/latency-heatmap 10.0.0.0/24 -p 1
   Total IPs to scan: 254
 
   Phase 1: Discovery - scanning 254 hosts...
-  Discovered: 12 hosts
+  Discovered: 4 hosts
 
   Phase 2: Measuring latency on 12 hosts (3 pings each)...
 
