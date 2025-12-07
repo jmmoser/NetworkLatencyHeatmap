@@ -672,10 +672,10 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
         }
         stdout.print("\n", .{}) catch {};
 
-        // Print heatmap blocks with min/avg/max latency
+        // Print heatmap blocks with min/avg/max latency (color based on avg)
         for (results[row_start..row_end]) |r| {
-            const color = latencyToColor(r.latency_us);
-            const block = latencyToBlock(r.latency_us);
+            const color = latencyToColor(r.latency_avg);
+            const block = latencyToBlock(r.latency_avg);
             var min_buf: [16]u8 = undefined;
             var avg_buf: [16]u8 = undefined;
             var max_buf: [16]u8 = undefined;
