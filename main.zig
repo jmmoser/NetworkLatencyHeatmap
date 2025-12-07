@@ -40,6 +40,97 @@ const PendingPing = struct {
     round: u8,
 };
 
+// State for parallel latency measurement (Phase 2)
+const LatencyState = struct {
+    // Atomic counters
+    current_round: std.atomic.Value(u8),
+    rounds_sent: std.atomic.Value(usize),
+    sender_done: std.atomic.Value(bool),
+
+    // Thread-safe pending pings and results (protected by mutex)
+    mutex: std.Thread.Mutex,
+    // Key is (ip_key << 8) | round to track each ping separately
+    pending: std.AutoHashMap(u64, i64), // (IP << 8 | round) -> send_time
+    latencies: std.AutoHashMap(u32, LatencyData), // IP -> collected latencies
+
+    // Shared socket and config
+    sock: posix.fd_t,
+    hosts: []const [4]u8,
+    config: Config,
+    allocator: std.mem.Allocator,
+
+    const LatencyData = struct {
+        samples: [16]u64, // Store up to 16 latency samples
+        count: u8,
+
+        fn init() LatencyData {
+            return LatencyData{
+                .samples = undefined,
+                .count = 0,
+            };
+        }
+
+        fn add(self: *LatencyData, latency: u64) void {
+            if (self.count < 16) {
+                self.samples[self.count] = latency;
+                self.count += 1;
+            }
+        }
+
+        fn getMin(self: *const LatencyData) ?u64 {
+            if (self.count == 0) return null;
+            var min: u64 = self.samples[0];
+            for (self.samples[1..self.count]) |s| {
+                if (s < min) min = s;
+            }
+            return min;
+        }
+
+        fn getMax(self: *const LatencyData) ?u64 {
+            if (self.count == 0) return null;
+            var max: u64 = self.samples[0];
+            for (self.samples[1..self.count]) |s| {
+                if (s > max) max = s;
+            }
+            return max;
+        }
+
+        fn getAvg(self: *const LatencyData) ?u64 {
+            if (self.count == 0) return null;
+            var total: u64 = 0;
+            for (self.samples[0..self.count]) |s| {
+                total += s;
+            }
+            return total / self.count;
+        }
+    };
+
+    fn init(allocator: std.mem.Allocator, hosts: []const [4]u8, config: Config, sock: posix.fd_t) LatencyState {
+        return LatencyState{
+            .current_round = std.atomic.Value(u8).init(0),
+            .rounds_sent = std.atomic.Value(usize).init(0),
+            .sender_done = std.atomic.Value(bool).init(false),
+            .mutex = std.Thread.Mutex{},
+            .pending = std.AutoHashMap(u64, i64).init(allocator),
+            .latencies = std.AutoHashMap(u32, LatencyData).init(allocator),
+            .sock = sock,
+            .hosts = hosts,
+            .config = config,
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *LatencyState) void {
+        self.pending.deinit();
+        self.latencies.deinit();
+    }
+
+    // Create composite key for pending map: (ip << 8) | round
+    fn pendingKey(ip_key: u32, round: u8) u64 {
+        return (@as(u64, ip_key) << 8) | @as(u64, round);
+    }
+};
+
 // Writer interface type for Zig 0.15
 const StdoutWriter = *std.Io.Writer;
 
@@ -178,7 +269,7 @@ fn pingMultiple(ip: [4]u8, count: u8, timeout_ms: u32) ?u64 {
                 min_latency = latency;
             }
         }
-        std.time.sleep(50 * std.time.ns_per_ms);
+        std.Thread.sleep(50 * std.time.ns_per_ms);
     }
 
     return min_latency;
@@ -232,6 +323,65 @@ const ScanState = struct {
         self.discovered.deinit();
     }
 };
+
+// Sender thread for Phase 2 latency measurement - sends pings in rounds
+fn latencySenderThread(state: *LatencyState) void {
+    for (0..state.config.latency_pings) |round| {
+        state.current_round.store(@intCast(round), .seq_cst);
+
+        for (state.hosts) |ip| {
+            const dest_addr = posix.sockaddr.in{
+                .family = posix.AF.INET,
+                .port = 0,
+                .addr = std.mem.bytesToValue(u32, &ip),
+            };
+
+            var packet: [64]u8 = undefined;
+            const header: *IcmpHeader = @ptrCast(@alignCast(&packet));
+            header.type = ICMP_ECHO_REQUEST;
+            header.code = 0;
+            header.checksum = 0;
+            const ip_key = ipToU32(ip);
+            // Encode round in sequence number for identification
+            header.id = @truncate(ip_key >> 16);
+            header.sequence = @truncate((ip_key & 0xFF) | (@as(u16, @intCast(round)) << 8));
+
+            for (packet[@sizeOf(IcmpHeader)..]) |*b| {
+                b.* = 0xAB;
+            }
+            header.checksum = calculateChecksum(&packet);
+
+            const send_time = std.time.microTimestamp();
+
+            // Record pending ping before sending (use composite key: ip << 8 | round)
+            const pending_key = LatencyState.pendingKey(ip_key, @intCast(round));
+            state.mutex.lock();
+            state.pending.put(pending_key, send_time) catch {};
+            state.mutex.unlock();
+
+            // Use C sendto directly to avoid Zig's panic on unknown errno
+            const rc = c.sendto(
+                state.sock,
+                &packet,
+                packet.len,
+                0,
+                @ptrCast(&dest_addr),
+                @sizeOf(posix.sockaddr.in),
+            );
+            _ = rc;
+
+            _ = state.rounds_sent.fetchAdd(1, .seq_cst);
+        }
+
+        // Delay between rounds - 100ms gives time for slow hosts to respond
+        // and prevents flooding the network
+        if (round + 1 < state.config.latency_pings) {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+    }
+
+    state.sender_done.store(true, .seq_cst);
+}
 
 // Sender thread function - uses shared socket
 fn senderThread(state: *ScanState) void {
@@ -465,7 +615,7 @@ const Scanner = struct {
         return alive_hosts;
     }
 
-    // Phase 2: Latency measurement (simpler, sequential for small host count)
+    // Phase 2: Parallel latency measurement using sender/receiver threads
     pub fn measureLatency(self: *Scanner, hosts: []const [4]u8, results: []PingResult, stdout: StdoutWriter) !void {
         if (hosts.len == 0) return;
 
@@ -482,81 +632,133 @@ const Scanner = struct {
             };
         }
 
-        // Set socket to blocking with timeout for latency phase
+        // Ensure socket is non-blocking for parallel receive
         const flags = posix.fcntl(self.sock, posix.F.GETFL, 0) catch 0;
-        _ = posix.fcntl(self.sock, posix.F.SETFL, flags & ~@as(usize, posix.SOCK.NONBLOCK)) catch {};
+        _ = posix.fcntl(self.sock, posix.F.SETFL, flags | @as(usize, posix.SOCK.NONBLOCK)) catch {};
 
-        const timeout = posix.timeval{
-            .sec = @intCast(self.config.latency_timeout_ms / 1000),
-            .usec = @intCast((self.config.latency_timeout_ms % 1000) * 1000),
-        };
-        posix.setsockopt(self.sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        var state = LatencyState.init(self.allocator, hosts, self.config, self.sock);
+        defer state.deinit();
 
-        var completed: usize = 0;
-        const total = hosts.len * self.config.latency_pings;
-
-        for (hosts, 0..) |ip, i| {
-            var min_latency: ?u64 = null;
-            var max_latency: ?u64 = null;
-            var total_latency: u64 = 0;
-            var success_count: u64 = 0;
-
-            for (0..self.config.latency_pings) |_| {
-                // Send ping
-                const dest_addr = posix.sockaddr.in{
-                    .family = posix.AF.INET,
-                    .port = 0,
-                    .addr = std.mem.bytesToValue(u32, &ip),
-                };
-
-                var packet: [64]u8 = undefined;
-                const header: *IcmpHeader = @ptrCast(@alignCast(&packet));
-                header.type = ICMP_ECHO_REQUEST;
-                header.code = 0;
-                header.checksum = 0;
-                const ip_key = ipToU32(ip);
-                header.id = @truncate(ip_key >> 16);
-                header.sequence = @truncate(ip_key & 0xFFFF);
-                for (packet[@sizeOf(IcmpHeader)..]) |*b| b.* = 0xAB;
-                header.checksum = calculateChecksum(&packet);
-
-                const start = std.time.microTimestamp();
-                _ = posix.sendto(self.sock, &packet, 0, @ptrCast(&dest_addr), @sizeOf(posix.sockaddr.in)) catch {
-                    completed += 1;
-                    continue;
-                };
-
-                // Wait for reply
-                var recv_buf: [1024]u8 = undefined;
-                _ = posix.recvfrom(self.sock, &recv_buf, 0, null, null) catch {
-                    completed += 1;
-                    continue;
-                };
-
-                const latency: u64 = @intCast(std.time.microTimestamp() - start);
-                if (min_latency == null or latency < min_latency.?) {
-                    min_latency = latency;
-                }
-                if (max_latency == null or latency > max_latency.?) {
-                    max_latency = latency;
-                }
-                total_latency += latency;
-                success_count += 1;
-                completed += 1;
-            }
-
-            results[i].latency_us = min_latency;
-            results[i].latency_max = max_latency;
-            results[i].latency_avg = if (success_count > 0) total_latency / success_count else null;
-
-            if ((i + 1) % 5 == 0 or i == hosts.len - 1) {
-                printProgress(stdout, completed, total);
-            }
+        // Pre-initialize latency data for all hosts
+        for (hosts) |ip| {
+            const ip_key = ipToU32(ip);
+            state.latencies.put(ip_key, LatencyState.LatencyData.init()) catch {};
         }
+
+        // Start sender thread
+        const sender = try std.Thread.spawn(.{}, latencySenderThread, .{&state});
+
+        // Give sender a moment to start
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+
+        // Main thread receives replies
+        var recv_buf: [1024]u8 = undefined;
+        const total_pings = hosts.len * self.config.latency_pings;
+        var responses_received: usize = 0;
+        var last_print: i64 = 0;
+        var sender_finish_time: ?i64 = null;
+
+        while (true) {
+            const now = std.time.microTimestamp();
+            const sender_done = state.sender_done.load(.seq_cst);
+
+            // Record when sender finishes
+            if (sender_done and sender_finish_time == null) {
+                sender_finish_time = now;
+            }
+
+            // Check exit conditions
+            if (sender_finish_time) |finish_time| {
+                const time_since_finish_ms = @divFloor(now - finish_time, 1000);
+                if (time_since_finish_ms > self.config.latency_timeout_ms) {
+                    break;
+                }
+            }
+
+            // Update progress periodically
+            if (now - last_print > 100_000) {
+                last_print = now;
+                const sent = state.rounds_sent.load(.seq_cst);
+                printProgress(stdout, @min(sent, total_pings), total_pings);
+            }
+
+            // Try to receive
+            var src_addr_c: posix.sockaddr.in = undefined;
+            var addr_len_c: c.socklen_t = @sizeOf(posix.sockaddr.in);
+            const recv_rc = c.recvfrom(
+                self.sock,
+                &recv_buf,
+                recv_buf.len,
+                c.MSG.DONTWAIT,
+                @ptrCast(&src_addr_c),
+                &addr_len_c,
+            );
+
+            if (recv_rc < 0) {
+                const err = std.c._errno().*;
+                if (err == 35) { // EAGAIN/EWOULDBLOCK on macOS
+                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    continue;
+                }
+                continue;
+            }
+
+            const recv_len: usize = @intCast(recv_rc);
+            const recv_time = std.time.microTimestamp();
+
+            // Parse ICMP reply
+            var icmp_offset: usize = 0;
+            if (self.is_raw_socket and recv_len >= 20 and (recv_buf[0] >> 4) == 4) {
+                icmp_offset = (@as(usize, recv_buf[0] & 0x0F)) * 4;
+            }
+            if (recv_len < icmp_offset + @sizeOf(IcmpHeader)) continue;
+
+            const icmp_reply: *const IcmpHeader = @ptrCast(@alignCast(&recv_buf[icmp_offset]));
+            if (icmp_reply.type != ICMP_ECHO_REPLY) continue;
+
+            // Extract source IP
+            const src_ip_bytes: [4]u8 = @bitCast(src_addr_c.addr);
+            const src_ip_key = ipToU32(src_ip_bytes);
+
+            // Extract round from sequence number (we encoded it as: (ip & 0xFF) | (round << 8))
+            const round: u8 = @truncate(icmp_reply.sequence >> 8);
+
+            // Look up pending ping using composite key and calculate latency
+            const pending_key = LatencyState.pendingKey(src_ip_key, round);
+            state.mutex.lock();
+            if (state.pending.get(pending_key)) |send_time| {
+                const latency: u64 = @intCast(@max(0, recv_time - send_time));
+
+                // Record latency
+                if (state.latencies.getPtr(src_ip_key)) |lat_data| {
+                    lat_data.add(latency);
+                }
+
+                // Remove from pending
+                _ = state.pending.remove(pending_key);
+                responses_received += 1;
+            }
+            state.mutex.unlock();
+        }
+
+        // Wait for sender to finish
+        sender.join();
 
         stdout.print("\n", .{}) catch {};
 
-        // Restore non-blocking
+        // Copy results from state to output array
+        for (hosts, 0..) |ip, i| {
+            const ip_key = ipToU32(ip);
+            state.mutex.lock();
+            if (state.latencies.get(ip_key)) |lat_data| {
+                results[i].latency_us = lat_data.getMin();
+                results[i].latency_avg = lat_data.getAvg();
+                results[i].latency_max = lat_data.getMax();
+            }
+            state.mutex.unlock();
+        }
+
+        // Restore original socket flags
         _ = posix.fcntl(self.sock, posix.F.SETFL, flags) catch {};
     }
 };
@@ -797,7 +999,7 @@ fn printProgress(stdout: StdoutWriter, done: usize, total: usize) void {
     const bar_width: usize = 40;
     const filled = @as(usize, @intFromFloat(@as(f64, @floatFromInt(bar_width)) * percent / 100.0));
 
-    stdout.print("\r  Scanning: [", .{}) catch {};
+    stdout.print("\r  Measuring: [", .{}) catch {};
     for (0..bar_width) |i| {
         if (i < filled) {
             stdout.print("█", .{}) catch {};
