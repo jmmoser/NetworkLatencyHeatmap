@@ -625,11 +625,19 @@ fn generateIpRange(allocator: std.mem.Allocator, subnet: [4]u8, mask_bits: u8) !
 }
 
 fn displayWidth(s: []const u8) usize {
-    // Count display width, accounting for multi-byte UTF-8 characters
+    // Count display width, accounting for multi-byte UTF-8 and ANSI escape sequences
     var width: usize = 0;
     var i: usize = 0;
     while (i < s.len) {
         const byte = s[i];
+        // Skip ANSI escape sequences (e.g., \x1b[32m)
+        if (byte == 0x1b and i + 1 < s.len and s[i + 1] == '[') {
+            i += 2;
+            // Skip until we hit the final byte of the sequence (letter)
+            while (i < s.len and (s[i] < 0x40 or s[i] > 0x7E)) : (i += 1) {}
+            if (i < s.len) i += 1; // Skip the final letter
+            continue;
+        }
         if (byte < 0x80) {
             // ASCII
             width += 1;
@@ -672,10 +680,10 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
         }
         stdout.print("\n", .{}) catch {};
 
-        // Print heatmap blocks with min/avg/max latency (color based on avg)
+        // Print heatmap blocks with min/avg/max latency (each colored independently)
         for (results[row_start..row_end]) |r| {
-            const color = latencyToColor(r.latency_avg);
             const block = latencyToBlock(r.latency_avg);
+            const block_color = latencyToColor(r.latency_avg);
             var min_buf: [16]u8 = undefined;
             var avg_buf: [16]u8 = undefined;
             var max_buf: [16]u8 = undefined;
@@ -683,14 +691,20 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
             const avg_str = formatLatency(r.latency_avg, &avg_buf);
             const max_str = formatLatency(r.latency_max, &max_buf);
 
-            // Format: "█ min/avg/max"
-            var lat_combined: [48]u8 = undefined;
-            const combined_str = if (r.latency_us != null)
-                std.fmt.bufPrint(&lat_combined, "{s}/{s}/{s}", .{ min_str, avg_str, max_str }) catch "???"
-            else
-                "---";
+            // Format: "█ min/avg/max" with each value colored independently
+            var lat_combined: [128]u8 = undefined;
+            const combined_str = if (r.latency_us != null) blk: {
+                const min_color = latencyToColor(r.latency_us);
+                const avg_color = latencyToColor(r.latency_avg);
+                const max_color = latencyToColor(r.latency_max);
+                break :blk std.fmt.bufPrint(&lat_combined, "{s}{s}{s}/{s}{s}{s}/{s}{s}{s}", .{
+                    min_color, min_str, reset,
+                    avg_color, avg_str, reset,
+                    max_color, max_str, reset,
+                }) catch "???";
+            } else "---";
 
-            stdout.print("{s}{s} {s}{s}", .{ color, block, combined_str, reset }) catch {};
+            stdout.print("{s}{s}{s} {s}", .{ block_color, block, reset, combined_str }) catch {};
             // 2 display chars for "█ ", rest is latency string (use display width for proper alignment)
             const used = 2 + displayWidth(combined_str);
             if (used < col_width) {
