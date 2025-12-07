@@ -723,21 +723,21 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
 
 fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
     var alive_count: usize = 0;
-    var total_latency: u64 = 0;
-    var min_latency: u64 = std.math.maxInt(u64);
-    var max_latency: u64 = 0;
+    var total_avg_latency: u64 = 0;
+    var best_avg: u64 = std.math.maxInt(u64);
+    var worst_avg: u64 = 0;
     var slow_devices: [10]PingResult = undefined;
     var slow_count: usize = 0;
 
     for (results) |r| {
-        if (r.latency_us) |lat| {
+        if (r.latency_avg) |avg_lat| {
             alive_count += 1;
-            total_latency += lat;
-            if (lat < min_latency) min_latency = lat;
-            if (lat > max_latency) max_latency = lat;
+            total_avg_latency += avg_lat;
+            if (avg_lat < best_avg) best_avg = avg_lat;
+            if (avg_lat > worst_avg) worst_avg = avg_lat;
 
-            // Track slow devices (>20ms)
-            if (lat > 20000) {
+            // Track slow devices (avg >20ms)
+            if (avg_lat > 20000) {
                 if (slow_count < 10) {
                     slow_devices[slow_count] = r;
                     slow_count += 1;
@@ -761,20 +761,20 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
         var buf2: [16]u8 = undefined;
         var buf3: [16]u8 = undefined;
 
-        stdout.print("\n  Latency stats:\n", .{}) catch {};
-        stdout.print("    Min: {s}\n", .{formatLatency(min_latency, &buf1)}) catch {};
-        stdout.print("    Avg: {s}\n", .{formatLatency(total_latency / alive_count, &buf2)}) catch {};
-        stdout.print("    Max: {s}\n", .{formatLatency(max_latency, &buf3)}) catch {};
+        stdout.print("\n  Latency stats (by avg):\n", .{}) catch {};
+        stdout.print("    Best:  {s}\n", .{formatLatency(best_avg, &buf1)}) catch {};
+        stdout.print("    Mean:  {s}\n", .{formatLatency(total_avg_latency / alive_count, &buf2)}) catch {};
+        stdout.print("    Worst: {s}\n", .{formatLatency(worst_avg, &buf3)}) catch {};
     }
 
     if (slow_count > 0) {
-        stdout.print("\n  \x1b[93m⚠ Slow devices (>20ms):\x1b[0m\n", .{}) catch {};
+        stdout.print("\n  \x1b[93m⚠ Slow devices (avg >20ms):\x1b[0m\n", .{}) catch {};
         for (slow_devices[0..slow_count]) |r| {
             var ip_buf: [16]u8 = undefined;
             var lat_buf: [16]u8 = undefined;
-            stdout.print("    {s}: {s}\n", .{
+            stdout.print("    {s}: {s} avg\n", .{
                 ipToString(r.ip, &ip_buf),
-                formatLatency(r.latency_us, &lat_buf),
+                formatLatency(r.latency_avg, &lat_buf),
             }) catch {};
         }
     }
