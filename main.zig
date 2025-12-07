@@ -16,7 +16,9 @@ const IcmpHeader = extern struct {
 
 const PingResult = struct {
     ip: [4]u8,
-    latency_us: ?u64, // microseconds, null if timeout
+    latency_us: ?u64, // microseconds, null if timeout (min latency)
+    latency_avg: ?u64, // average latency
+    latency_max: ?u64, // max latency
     hostname: ?[]const u8,
 
     pub fn isAlive(self: PingResult) bool {
@@ -28,7 +30,7 @@ const Config = struct {
     subnet: [4]u8 = .{ 192, 168, 1, 0 },
     mask_bits: u8 = 24,
     discovery_timeout_ms: u32 = 1000, // Time to wait for discovery responses
-    latency_pings: u8 = 3, // Number of pings per host for latency measurement
+    latency_pings: u8 = 5, // Number of pings per host for latency measurement
     latency_timeout_ms: u32 = 1000, // Timeout per ping in latency phase
 };
 
@@ -474,6 +476,8 @@ const Scanner = struct {
             r.* = PingResult{
                 .ip = hosts[i],
                 .latency_us = null,
+                .latency_avg = null,
+                .latency_max = null,
                 .hostname = null,
             };
         }
@@ -493,6 +497,9 @@ const Scanner = struct {
 
         for (hosts, 0..) |ip, i| {
             var min_latency: ?u64 = null;
+            var max_latency: ?u64 = null;
+            var total_latency: u64 = 0;
+            var success_count: u64 = 0;
 
             for (0..self.config.latency_pings) |_| {
                 // Send ping
@@ -530,10 +537,17 @@ const Scanner = struct {
                 if (min_latency == null or latency < min_latency.?) {
                     min_latency = latency;
                 }
+                if (max_latency == null or latency > max_latency.?) {
+                    max_latency = latency;
+                }
+                total_latency += latency;
+                success_count += 1;
                 completed += 1;
             }
 
             results[i].latency_us = min_latency;
+            results[i].latency_max = max_latency;
+            results[i].latency_avg = if (success_count > 0) total_latency / success_count else null;
 
             if ((i + 1) % 5 == 0 or i == hosts.len - 1) {
                 printProgress(stdout, completed, total);
@@ -610,9 +624,36 @@ fn generateIpRange(allocator: std.mem.Allocator, subnet: [4]u8, mask_bits: u8) !
     return ips;
 }
 
+fn displayWidth(s: []const u8) usize {
+    // Count display width, accounting for multi-byte UTF-8 characters
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const byte = s[i];
+        if (byte < 0x80) {
+            // ASCII
+            width += 1;
+            i += 1;
+        } else if (byte < 0xE0) {
+            // 2-byte UTF-8 (includes µ)
+            width += 1;
+            i += 2;
+        } else if (byte < 0xF0) {
+            // 3-byte UTF-8
+            width += 1;
+            i += 3;
+        } else {
+            // 4-byte UTF-8
+            width += 1;
+            i += 4;
+        }
+    }
+    return width;
+}
+
 fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: usize) void {
     const reset = "\x1b[0m";
-    const col_width = 18; // Fixed column width for alignment
+    const col_width = 28; // Fixed column width for alignment
 
     stdout.print("\n", .{}) catch {};
 
@@ -620,32 +661,44 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
     while (row_start < results.len) {
         const row_end = @min(row_start + width, results.len);
 
-        // Print IP labels for this row
+        // Print IP labels for this row (left-padded to col_width)
         for (results[row_start..row_end]) |r| {
             var buf: [16]u8 = undefined;
             const ip_str = ipToString(r.ip, &buf);
-            // Pad IP string to fixed column width
             stdout.print("{s}", .{ip_str}) catch {};
-            const padding = col_width - ip_str.len;
-            for (0..padding) |_| {
+            for (0..(col_width - ip_str.len)) |_| {
                 stdout.print(" ", .{}) catch {};
             }
         }
         stdout.print("\n", .{}) catch {};
 
-        // Print heatmap blocks with latency
+        // Print heatmap blocks with min/avg/max latency
         for (results[row_start..row_end]) |r| {
             const color = latencyToColor(r.latency_us);
             const block = latencyToBlock(r.latency_us);
-            var lat_buf: [16]u8 = undefined;
-            const lat_str = formatLatency(r.latency_us, &lat_buf);
-            // Block + space + latency, then pad to column width
-            stdout.print("{s}{s} {s}{s}", .{ color, block, lat_str, reset }) catch {};
-            // 2 chars for block+space, plus latency length
-            const used = 2 + lat_str.len;
-            const padding = col_width - used;
-            for (0..padding) |_| {
-                stdout.print(" ", .{}) catch {};
+            var min_buf: [16]u8 = undefined;
+            var avg_buf: [16]u8 = undefined;
+            var max_buf: [16]u8 = undefined;
+            const min_str = formatLatency(r.latency_us, &min_buf);
+            const avg_str = formatLatency(r.latency_avg, &avg_buf);
+            const max_str = formatLatency(r.latency_max, &max_buf);
+
+            // Format: "█ min/avg/max"
+            var lat_combined: [48]u8 = undefined;
+            const combined_str = if (r.latency_us != null)
+                std.fmt.bufPrint(&lat_combined, "{s}/{s}/{s}", .{ min_str, avg_str, max_str }) catch "???"
+            else
+                "---";
+
+            stdout.print("{s}{s} {s}{s}", .{ color, block, combined_str, reset }) catch {};
+            // 2 display chars for "█ ", rest is latency string (use display width for proper alignment)
+            const used = 2 + displayWidth(combined_str);
+            if (used < col_width) {
+                for (0..(col_width - used)) |_| {
+                    stdout.print(" ", .{}) catch {};
+                }
+            } else {
+                stdout.print(" ", .{}) catch {}; // At least one space between columns
             }
         }
         stdout.print("\n\n", .{}) catch {};
