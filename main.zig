@@ -769,8 +769,9 @@ const Scanner = struct {
         return alive_hosts;
     }
 
-    // Phase 2: Simple sequential latency measurement (like ping)
-    // Send one packet, wait for response, repeat. Accurate but slower.
+    // Phase 2: Parallel latency measurement across hosts
+    // For each round: send to ALL hosts, then collect ALL responses
+    // This is fast but still accurate because we track send times per-host
     pub fn measureLatency(self: *Scanner, hosts: []const [4]u8, results: []PingResult, stdout: StdoutWriter) !void {
         if (hosts.len == 0) return;
 
@@ -787,26 +788,29 @@ const Scanner = struct {
             };
         }
 
-        // Set socket to blocking with timeout
+        // Allocate arrays to track per-host latencies
+        const latencies = try self.allocator.alloc(LatencyState.LatencyData, hosts.len);
+        defer self.allocator.free(latencies);
+        for (latencies) |*lat| lat.* = LatencyState.LatencyData.init();
+
+        // Allocate array for send times (one per host, reused each round)
+        const send_times = try self.allocator.alloc(i64, hosts.len);
+        defer self.allocator.free(send_times);
+
+        // Ensure socket is non-blocking for receive
         const flags = posix.fcntl(self.sock, posix.F.GETFL, 0) catch 0;
-        _ = posix.fcntl(self.sock, posix.F.SETFL, flags & ~@as(usize, posix.SOCK.NONBLOCK)) catch {};
+        _ = posix.fcntl(self.sock, posix.F.SETFL, flags | @as(usize, posix.SOCK.NONBLOCK)) catch {};
 
-        const timeout = posix.timeval{
-            .sec = @intCast(self.config.latency_timeout_ms / 1000),
-            .usec = @intCast((self.config.latency_timeout_ms % 1000) * 1000),
-        };
-        posix.setsockopt(self.sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
-
+        const total_pings = hosts.len * self.config.latency_pings;
         var completed: usize = 0;
-        const total = hosts.len * self.config.latency_pings;
 
-        for (hosts, 0..) |ip, host_idx| {
-            var min_latency: ?u64 = null;
-            var max_latency: ?u64 = null;
-            var total_latency: u64 = 0;
-            var success_count: u64 = 0;
+        // Do multiple rounds
+        for (0..self.config.latency_pings) |round| {
+            // Reset send times
+            for (send_times) |*st| st.* = 0;
 
-            for (0..self.config.latency_pings) |ping_num| {
+            // Send to all hosts, recording send time for each
+            for (hosts, 0..) |ip, host_idx| {
                 const dest_addr = posix.sockaddr.in{
                     .family = posix.AF.INET,
                     .port = 0,
@@ -819,14 +823,13 @@ const Scanner = struct {
                 header.code = 0;
                 header.checksum = 0;
                 header.id = @truncate(host_idx);
-                header.sequence = @intCast(ping_num);
+                header.sequence = @intCast(round);
                 for (packet[@sizeOf(IcmpHeader)..]) |*b| b.* = 0xAB;
                 header.checksum = calculateChecksum(&packet);
 
-                const start = std.time.microTimestamp();
+                send_times[host_idx] = std.time.microTimestamp();
 
-                // Send
-                const send_rc = c.sendto(
+                _ = c.sendto(
                     self.sock,
                     &packet,
                     packet.len,
@@ -834,58 +837,87 @@ const Scanner = struct {
                     @ptrCast(&dest_addr),
                     @sizeOf(posix.sockaddr.in),
                 );
-                if (send_rc < 0) {
-                    completed += 1;
+            }
+
+            // Collect responses until timeout
+            const round_start = std.time.microTimestamp();
+            var responses_this_round: usize = 0;
+            var recv_buf: [1024]u8 = undefined;
+
+            while (responses_this_round < hosts.len) {
+                const now = std.time.microTimestamp();
+                const elapsed_ms = @divFloor(now - round_start, 1000);
+                if (elapsed_ms > self.config.latency_timeout_ms) break;
+
+                // Try to receive
+                var src_addr_c: posix.sockaddr.in = undefined;
+                var addr_len_c: c.socklen_t = @sizeOf(posix.sockaddr.in);
+                const recv_rc = c.recvfrom(
+                    self.sock,
+                    &recv_buf,
+                    recv_buf.len,
+                    c.MSG.DONTWAIT,
+                    @ptrCast(&src_addr_c),
+                    &addr_len_c,
+                );
+
+                if (recv_rc < 0) {
+                    // No packet available, wait briefly
+                    _ = self.poller.wait(1);
                     continue;
                 }
 
-                // Wait for reply (blocking with timeout)
-                var recv_buf: [1024]u8 = undefined;
-                const recv_result = posix.recvfrom(self.sock, &recv_buf, 0, null, null);
+                const recv_time = std.time.microTimestamp();
+                const recv_len: usize = @intCast(recv_rc);
 
-                if (recv_result) |recv_len| {
-                    const end = std.time.microTimestamp();
-
-                    // Verify it's an ICMP echo reply
-                    var icmp_offset: usize = 0;
-                    if (self.is_raw_socket and recv_len >= 20 and (recv_buf[0] >> 4) == 4) {
-                        icmp_offset = (@as(usize, recv_buf[0] & 0x0F)) * 4;
-                    }
-
-                    if (recv_len >= icmp_offset + @sizeOf(IcmpHeader)) {
-                        const icmp_reply: *const IcmpHeader = @ptrCast(@alignCast(&recv_buf[icmp_offset]));
-                        if (icmp_reply.type == ICMP_ECHO_REPLY) {
-                            const latency: u64 = @intCast(end - start);
-                            if (min_latency == null or latency < min_latency.?) {
-                                min_latency = latency;
-                            }
-                            if (max_latency == null or latency > max_latency.?) {
-                                max_latency = latency;
-                            }
-                            total_latency += latency;
-                            success_count += 1;
-                        }
-                    }
-                } else |_| {
-                    // Timeout or error - no response
+                // Parse ICMP reply
+                var icmp_offset: usize = 0;
+                if (self.is_raw_socket and recv_len >= 20 and (recv_buf[0] >> 4) == 4) {
+                    icmp_offset = (@as(usize, recv_buf[0] & 0x0F)) * 4;
                 }
+                if (recv_len < icmp_offset + @sizeOf(IcmpHeader)) continue;
 
+                const icmp_reply: *const IcmpHeader = @ptrCast(@alignCast(&recv_buf[icmp_offset]));
+                if (icmp_reply.type != ICMP_ECHO_REPLY) continue;
+
+                // Extract host_idx from id field
+                const host_idx: usize = icmp_reply.id;
+                if (host_idx >= hosts.len) continue;
+
+                // Check it's from current round
+                const reply_round: usize = icmp_reply.sequence;
+                if (reply_round != round) continue;
+
+                // Calculate latency
+                const send_time = send_times[host_idx];
+                if (send_time == 0) continue; // Already processed or invalid
+
+                const latency: u64 = @intCast(@max(0, recv_time - send_time));
+                latencies[host_idx].add(latency);
+
+                send_times[host_idx] = 0; // Mark as processed
+                responses_this_round += 1;
                 completed += 1;
             }
 
-            results[host_idx].latency_us = min_latency;
-            results[host_idx].latency_max = max_latency;
-            results[host_idx].latency_avg = if (success_count > 0) total_latency / success_count else null;
-
-            // Update progress every few hosts
-            if ((host_idx + 1) % 3 == 0 or host_idx == hosts.len - 1) {
-                printProgress(stdout, completed, total);
+            // Count non-responses as completed too
+            for (send_times) |st| {
+                if (st != 0) completed += 1;
             }
+
+            printProgress(stdout, completed, total_pings);
         }
 
         stdout.print("\n", .{}) catch {};
 
-        // Restore non-blocking
+        // Copy results
+        for (0..hosts.len) |i| {
+            results[i].latency_us = latencies[i].getMin();
+            results[i].latency_avg = latencies[i].getAvg();
+            results[i].latency_max = latencies[i].getMax();
+        }
+
+        // Restore socket flags
         _ = posix.fcntl(self.sock, posix.F.SETFL, flags) catch {};
     }
 };
