@@ -7,6 +7,76 @@ const builtin = @import("builtin");
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
 
+// Network interface detection using getifaddrs
+const ifaddrs = extern struct {
+    next: ?*ifaddrs,
+    name: [*:0]const u8,
+    flags: c_uint,
+    addr: ?*posix.sockaddr,
+    netmask: ?*posix.sockaddr,
+    data: ?*anyopaque, // ifu_broadaddr or ifu_dstaddr union
+    data2: ?*anyopaque,
+};
+
+extern "c" fn getifaddrs(ifap: *?*ifaddrs) c_int;
+extern "c" fn freeifaddrs(ifa: *ifaddrs) void;
+
+const IFF_UP: c_uint = 0x1;
+const IFF_LOOPBACK: c_uint = 0x8;
+const IFF_RUNNING: c_uint = 0x40;
+
+fn detectLocalSubnet() ?struct { subnet: [4]u8, mask: u8 } {
+    var ifa_list: ?*ifaddrs = null;
+    if (getifaddrs(&ifa_list) != 0) return null;
+    defer if (ifa_list) |list| freeifaddrs(list);
+
+    var ifa = ifa_list;
+    while (ifa) |iface| : (ifa = iface.next) {
+        // Skip loopback and down interfaces
+        if ((iface.flags & IFF_LOOPBACK) != 0) continue;
+        if ((iface.flags & IFF_UP) == 0) continue;
+        if ((iface.flags & IFF_RUNNING) == 0) continue;
+
+        // Only handle IPv4 (AF_INET = 2)
+        const addr = iface.addr orelse continue;
+        if (addr.family != posix.AF.INET) continue;
+
+        const netmask = iface.netmask orelse continue;
+        if (netmask.family != posix.AF.INET) continue;
+
+        // Get the sockaddr_in pointers
+        const addr_in: *const posix.sockaddr.in = @ptrCast(@alignCast(addr));
+        const mask_in: *const posix.sockaddr.in = @ptrCast(@alignCast(netmask));
+
+        // Get IP address bytes (network byte order)
+        const ip_bytes: [4]u8 = @bitCast(addr_in.addr);
+        const mask_bytes: [4]u8 = @bitCast(mask_in.addr);
+
+        // Skip link-local addresses (169.254.x.x)
+        if (ip_bytes[0] == 169 and ip_bytes[1] == 254) continue;
+
+        // Calculate mask bits from netmask
+        var mask_bits: u8 = 0;
+        for (mask_bytes) |byte| {
+            var b = byte;
+            while (b != 0) : (b <<= 1) {
+                if ((b & 0x80) != 0) mask_bits += 1 else break;
+            }
+        }
+
+        // Calculate network address (IP & mask)
+        const subnet: [4]u8 = .{
+            ip_bytes[0] & mask_bytes[0],
+            ip_bytes[1] & mask_bytes[1],
+            ip_bytes[2] & mask_bytes[2],
+            ip_bytes[3] & mask_bytes[3],
+        };
+
+        return .{ .subnet = subnet, .mask = mask_bits };
+    }
+    return null;
+}
+
 // Platform-agnostic event poller for socket readiness
 const SocketPoller = struct {
     // Use kqueue on macOS/BSD, epoll on Linux
@@ -1252,7 +1322,11 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    var config = Config{};
+    // Detect local subnet, fall back to 192.168.1.0/24
+    var config = if (detectLocalSubnet()) |detected|
+        Config{ .subnet = detected.subnet, .mask_bits = detected.mask }
+    else
+        Config{};
 
     // Parse command line args
     if (args.len > 1) {
@@ -1264,14 +1338,17 @@ pub fn main() !void {
                 \\Usage: {s} [subnet/mask] [options]
                 \\
                 \\Examples:
+                \\  {s}                      (auto-detect local subnet)
                 \\  {s} 192.168.1.0/24
                 \\  {s} 192.168.0.0/16 -d 3000
                 \\
                 \\Options:
-                \\  -d <ms>     Discovery timeout in milliseconds (default: 5000)
-                \\  -p <count>  Number of pings per host for latency (default: 3)
+                \\  -d <ms>     Discovery timeout in milliseconds (default: 1000)
+                \\  -p <count>  Number of pings per host for latency (default: 5)
                 \\  -t <ms>     Timeout per ping in latency phase (default: 1000)
                 \\  -h, --help  Show this help
+                \\
+                \\The subnet is auto-detected from your network interface if not specified.
                 \\
                 \\How it works:
                 \\  Phase 1: Blasts pings to all IPs, waits for discovery timeout
@@ -1279,7 +1356,7 @@ pub fn main() !void {
                 \\
                 \\Note: Requires root/sudo for raw ICMP sockets on most systems.
                 \\
-            , .{ args[0], args[0], args[0] }) catch {};
+            , .{ args[0], args[0], args[0], args[0] }) catch {};
             return;
         }
 
