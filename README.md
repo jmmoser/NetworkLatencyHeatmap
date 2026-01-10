@@ -1,6 +1,6 @@
-# Local Network Latency Heatmap Scanner
+# Network Latency Heatmap Scanner
 
-A fast network scanner that discovers hosts on your local network and measures their latency, displaying results as a visual heatmap.
+A fast network scanner that discovers hosts on your network and measures their latency, displaying results as a visual heatmap.
 
 ## Features
 
@@ -79,7 +79,7 @@ sudo ./zig-out/bin/latency-heatmap 10.0.0.0/24 -p 1
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
-║       Local Network Latency Heatmap Scanner                  ║
+║       Network Latency Heatmap Scanner                        ║
 ╚══════════════════════════════════════════════════════════════╝
 
   Subnet: 192.168.1.0/24

@@ -1383,7 +1383,7 @@ pub fn main() !void {
     // Print banner
     stdout.print("\n", .{}) catch {};
     stdout.print("\x1b[96m╔══════════════════════════════════════════════════════════════╗\x1b[0m\n", .{}) catch {};
-    stdout.print("\x1b[96m║\x1b[0m       \x1b[1mLocal Network Latency Heatmap Scanner\x1b[0m                  \x1b[96m║\x1b[0m\n", .{}) catch {};
+    stdout.print("\x1b[96m║\x1b[0m             \x1b[1mNetwork Latency Heatmap Scanner\x1b[0m                  \x1b[96m║\x1b[0m\n", .{}) catch {};
     stdout.print("\x1b[96m╚══════════════════════════════════════════════════════════════╝\x1b[0m\n", .{}) catch {};
 
     var subnet_buf: [32]u8 = undefined;
