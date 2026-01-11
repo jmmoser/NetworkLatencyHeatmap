@@ -923,15 +923,13 @@ const Scanner = struct {
             }
 
             // Send next ping if it's time
-            if (!all_sent and (now - last_send_time) >= inter_ping_delay_us) {
+            if (!all_sent and (now - last_send_time) >= inter_ping_delay_us) send: {
                 // Check if we need to wait between rounds
                 if (next_send_host == 0 and next_send_round > 0) {
                     // Starting a new round - add delay
                     if ((now - last_send_time) < round_delay_us) {
                         // Not ready for next round yet, just process receives
-                        goto_receive: {
-                            break :goto_receive;
-                        }
+                        break :send;
                     }
                 }
 
