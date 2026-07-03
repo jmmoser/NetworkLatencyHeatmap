@@ -11,7 +11,7 @@ A fast network scanner that discovers hosts on your network and measures their l
 
 ## Requirements
 
-- macOS (uses raw ICMP sockets)
+- macOS (kqueue) or Linux (epoll) — uses raw ICMP sockets
 - Root privileges (sudo) for raw socket access
 - Zig 0.15+
 
@@ -19,6 +19,12 @@ A fast network scanner that discovers hosts on your network and measures their l
 
 ```bash
 zig build
+```
+
+Run the unit tests with:
+
+```bash
+zig build test
 ```
 
 ## Usage
@@ -48,7 +54,7 @@ sudo ./zig-out/bin/latency-heatmap 10.0.0.0/24 -p 1
 | Option | Description | Default |
 |--------|-------------|---------|
 | `-d <ms>` | Discovery timeout in milliseconds | 1000 |
-| `-p <count>` | Number of pings per host for latency measurement | 3 |
+| `-p <count>` | Number of pings per host for latency measurement (1-16) | 5 |
 | `-t <ms>` | Timeout per ping in latency phase | 1000 |
 | `-h, --help` | Show help message | |
 
