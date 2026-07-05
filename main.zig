@@ -324,6 +324,14 @@ fn u32ToIp(val: u32) [4]u8 {
     };
 }
 
+// Monotonic clock in µs: immune to NTP steps and slews of the wall clock.
+// Used for all pacing/timeouts and as the step-safe RTT measurement; the
+// wall clock is only consulted to compare against kernel receive stamps.
+fn monotonicMicros() i64 {
+    const ts = posix.clock_gettime(.MONOTONIC) catch return std.time.microTimestamp();
+    return @as(i64, @intCast(ts.sec)) * std.time.us_per_s + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_us);
+}
+
 // State shared between the sender thread and the main (receiver) thread.
 // Only the atomics are written by the sender; everything else is read-only.
 const ScanState = struct {
@@ -568,7 +576,7 @@ const Scanner = struct {
             }
 
             // Now check exit conditions and update progress
-            const now = std.time.microTimestamp();
+            const now = monotonicMicros();
             const sender_done = state.sender_done.load(.seq_cst);
 
             // Record when sender finishes
@@ -655,11 +663,14 @@ const Scanner = struct {
         defer self.allocator.free(latencies);
         for (latencies) |*lat| lat.* = LatencyData.init();
 
-        // Allocate send times for ALL pings (hosts * rounds)
+        // Send times for ALL pings (hosts * rounds), in both clock domains:
+        // monotonic for the step-immune measurement, wall clock to compare
+        // against kernel receive stamps (which are wall clock only)
+        const SendTime = struct { mono: i64, real: i64 };
         const total_pings = hosts.len * num_rounds;
-        const send_times = try self.allocator.alloc(i64, total_pings);
+        const send_times = try self.allocator.alloc(SendTime, total_pings);
         defer self.allocator.free(send_times);
-        @memset(send_times, 0);
+        @memset(send_times, .{ .mono = 0, .real = 0 });
 
         // Track which pings have been received
         const received = try self.allocator.alloc(bool, total_pings);
@@ -704,7 +715,7 @@ const Scanner = struct {
 
         // Event loop: interleave sending and receiving
         while (true) {
-            const now = std.time.microTimestamp();
+            const now = monotonicMicros();
 
             // Check exit conditions
             if (all_sent) {
@@ -733,8 +744,8 @@ const Scanner = struct {
                 header.checksum = 0;
                 header.checksum = calculateChecksum(&packet);
 
-                // Record send time IMMEDIATELY before send
-                const send_time = std.time.microTimestamp();
+                // Record send time IMMEDIATELY before send, in both domains
+                const send_time = SendTime{ .mono = monotonicMicros(), .real = std.time.microTimestamp() };
                 send_times[ping_idx] = send_time;
 
                 _ = c.sendto(
@@ -746,7 +757,7 @@ const Scanner = struct {
                     @sizeOf(posix.sockaddr.in),
                 );
 
-                last_send_time = send_time;
+                last_send_time = send_time.mono;
 
                 // Advance to next ping
                 next_send_host += 1;
@@ -766,18 +777,13 @@ const Scanner = struct {
             if (has_data) {
                 // Drain ALL available packets immediately
                 while (true) {
-                    // Userspace timestamp taken BEFORE reading — only used as
-                    // a fallback when the kernel timestamp is unavailable
-                    const fallback_time = std.time.microTimestamp();
+                    // Monotonic timestamp taken BEFORE reading: the packet
+                    // has already arrived, so this is an upper bound on the
+                    // true RTT that is immune to wall-clock steps
+                    const recv_mono = monotonicMicros();
 
                     const pkt = self.recvPacket(&recv_buf) orelse break;
                     const recv_len = pkt.len;
-
-                    // Prefer the kernel's arrival timestamp: it is stamped
-                    // when the packet enters the network stack, so wakeup,
-                    // scheduling, and drain-queue delay in this process
-                    // don't inflate the sample
-                    const recv_time = pkt.kernel_ts_us orelse fallback_time;
 
                     // Parse ICMP reply - skip IP header for raw socket
                     var icmp_offset: usize = 0;
@@ -803,15 +809,27 @@ const Scanner = struct {
                     if (ping_idx >= total_pings or received[ping_idx]) continue;
 
                     const send_time = send_times[ping_idx];
-                    if (send_time == 0) continue; // Not sent yet (shouldn't happen)
+                    if (send_time.mono == 0) continue; // Not sent yet (shouldn't happen)
 
-                    const latency: u64 = @intCast(@max(0, recv_time - send_time));
+                    // Step-immune measurement from the monotonic clock
+                    const mono_rtt = recv_mono - send_time.mono;
+
+                    // Prefer the kernel's arrival stamp — it excludes our
+                    // wakeup/scheduling/drain delay — but the kernel only
+                    // offers it in the wall-clock domain, so accept it only
+                    // when consistent with the monotonic bound (a wall-clock
+                    // step mid-flight would otherwise corrupt the sample)
+                    var rtt = mono_rtt;
+                    if (pkt.kernel_ts_us) |kernel_time| {
+                        const kernel_rtt = kernel_time - send_time.real;
+                        if (kernel_rtt >= 0 and kernel_rtt <= mono_rtt) rtt = kernel_rtt;
+                    }
+
+                    const latency: u64 = @intCast(@max(0, rtt));
                     latencies[host_idx].add(latency);
                     received[ping_idx] = true;
                     responses_received += 1;
-                    // Loop control (adaptive timeout) uses the userspace
-                    // clock; the kernel timestamp is only for the sample
-                    last_response_time = fallback_time;
+                    last_response_time = recv_mono;
                 }
 
                 // Throttle progress output: stdout is unbuffered, so each
@@ -1344,6 +1362,13 @@ test "displayWidth ignores ANSI escapes and counts multi-byte chars once" {
     try testing.expectEqual(@as(usize, 3), displayWidth("abc"));
     try testing.expectEqual(@as(usize, 5), displayWidth("\x1b[92m1.2ms\x1b[0m"));
     try testing.expectEqual(@as(usize, 5), displayWidth("123µs"));
+}
+
+test "monotonicMicros is nondecreasing" {
+    const a = monotonicMicros();
+    const b = monotonicMicros();
+    try testing.expect(b >= a);
+    try testing.expect(a > 0);
 }
 
 test "kernel_ts.parse extracts SCM_TIMESTAMP, skipping unrelated cmsgs" {

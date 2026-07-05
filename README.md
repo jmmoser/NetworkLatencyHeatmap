@@ -6,6 +6,7 @@ A fast network scanner that discovers hosts on your network and measures their l
 
 - **Two-phase scanning**: Fast discovery phase followed by accurate latency measurement
 - **Kernel receive timestamps**: Uses `SO_TIMESTAMP` so replies are stamped by the kernel on arrival — process wakeup and scheduling delay don't inflate measured RTTs (falls back to userspace timestamps where unavailable)
+- **Monotonic timing**: All pacing, timeouts, and fallback measurements use `CLOCK_MONOTONIC`; kernel stamps (wall clock only) are cross-checked against a monotonic upper bound, so an NTP step or slew mid-scan can't corrupt samples or stall the scanner
 - **Visual heatmap**: Color-coded latency display to quickly identify slow devices
 - **Concurrent scanning**: Uses separate sender/receiver threads for maximum throughput
 - **Large subnet support**: Can scan /16 networks (65k+ hosts) efficiently
