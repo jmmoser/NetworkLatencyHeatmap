@@ -262,15 +262,11 @@ fn u32ToIp(val: u32) [4]u8 {
     };
 }
 
-// Shared state between sender and receiver threads
+// State shared between the sender thread and the main (receiver) thread.
+// Only the atomics are written by the sender; everything else is read-only.
 const ScanState = struct {
-    // Atomic counters
     sent_count: std.atomic.Value(usize),
     sender_done: std.atomic.Value(bool),
-
-    // Thread-safe discovered hosts (protected by mutex)
-    mutex: std.Thread.Mutex,
-    discovered: std.AutoHashMap(u32, void),
 
     // Shared socket
     sock: posix.fd_t,
@@ -278,28 +274,7 @@ const ScanState = struct {
     // Payload tag identifying this run's discovery packets
     magic: [4]u8,
 
-    // Config
     all_ips: []const [4]u8,
-    config: Config,
-    allocator: std.mem.Allocator,
-
-    fn init(allocator: std.mem.Allocator, all_ips: []const [4]u8, config: Config, sock: posix.fd_t, magic: [4]u8) ScanState {
-        return ScanState{
-            .sent_count = std.atomic.Value(usize).init(0),
-            .sender_done = std.atomic.Value(bool).init(false),
-            .mutex = std.Thread.Mutex{},
-            .discovered = std.AutoHashMap(u32, void).init(allocator),
-            .sock = sock,
-            .magic = magic,
-            .all_ips = all_ips,
-            .config = config,
-            .allocator = allocator,
-        };
-    }
-
-    fn deinit(self: *ScanState) void {
-        self.discovered.deinit();
-    }
 };
 
 // Sender thread function - uses shared socket
@@ -327,16 +302,28 @@ fn senderThread(state: *ScanState) void {
         header.checksum = calculateChecksum(&packet);
 
         // Use C sendto directly to avoid Zig's panic on unknown errno (like macOS EHOSTDOWN=64)
-        const rc = c.sendto(
-            state.sock,
-            &packet,
-            packet.len,
-            0,
-            @ptrCast(&dest_addr),
-            @sizeOf(posix.sockaddr.in),
-        );
-        // Ignore errors - host may be down, unreachable, etc.
-        _ = rc;
+        var tries: u32 = 0;
+        while (true) {
+            const rc = c.sendto(
+                state.sock,
+                &packet,
+                packet.len,
+                0,
+                @ptrCast(&dest_addr),
+                @sizeOf(posix.sockaddr.in),
+            );
+            if (rc >= 0) break;
+
+            // Blasting a subnet can fill the local send buffer; back off
+            // briefly and retry so the host isn't silently skipped. Other
+            // errors (host down, unreachable, ...) are expected and ignored.
+            const err = std.c._errno().*;
+            const buffer_full = err == @intFromEnum(posix.E.NOBUFS) or
+                err == @intFromEnum(posix.E.AGAIN);
+            if (!buffer_full or tries >= 100) break;
+            tries += 1;
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
 
         _ = state.sent_count.fetchAdd(1, .seq_cst);
     }
@@ -415,16 +402,23 @@ const Scanner = struct {
     // Phase 1: Discovery - sender thread + receiver in main thread
     pub fn discover(self: *Scanner, stdout: StdoutWriter) !std.ArrayList([4]u8) {
         const magic = self.phaseMagic(1);
-        var state = ScanState.init(self.allocator, self.all_ips, self.config, self.sock, magic);
-        defer state.deinit();
+        var state = ScanState{
+            .sent_count = std.atomic.Value(usize).init(0),
+            .sender_done = std.atomic.Value(bool).init(false),
+            .sock = self.sock,
+            .magic = magic,
+            .all_ips = self.all_ips,
+        };
+
+        // Discovered hosts; only this (receiver) thread touches the map,
+        // so no locking is needed.
+        var discovered = std.AutoHashMap(u32, void).init(self.allocator);
+        defer discovered.deinit();
 
         stdout.print("  Phase 1: Discovery - scanning {d} hosts...\n", .{self.all_ips.len}) catch {};
 
         // Start sender thread (shares the raw socket; replies are received here)
         const sender = try std.Thread.spawn(.{}, senderThread, .{&state});
-
-        // Give sender a moment to start
-        std.Thread.sleep(10 * std.time.ns_per_ms);
 
         // Only accept replies from addresses inside the scanned subnet
         const netmask: u32 = if (self.config.mask_bits >= 32)
@@ -483,9 +477,7 @@ const Scanner = struct {
                 const src_ip_key = ipToU32(src_ip_bytes);
                 if ((src_ip_key & netmask) != network) continue;
 
-                state.mutex.lock();
-                state.discovered.put(src_ip_key, {}) catch {};
-                state.mutex.unlock();
+                discovered.put(src_ip_key, {}) catch {};
             }
 
             // Now check exit conditions and update progress
@@ -504,9 +496,7 @@ const Scanner = struct {
                 const time_since_finish_us = now - finish_time;
                 const time_since_finish_ms = @divFloor(time_since_finish_us, 1000);
 
-                state.mutex.lock();
-                const discovered_count = state.discovered.count();
-                state.mutex.unlock();
+                const discovered_count = discovered.count();
 
                 // Exit early if no hosts discovered after 500ms
                 if (discovered_count == 0 and time_since_finish_ms > 500) {
@@ -524,9 +514,7 @@ const Scanner = struct {
             if (now - last_print > 100_000) {
                 last_print = now;
                 const sent = state.sent_count.load(.seq_cst);
-                state.mutex.lock();
-                const discovered_count = state.discovered.count();
-                state.mutex.unlock();
+                const discovered_count = discovered.count();
 
                 if (!sender_done) {
                     stdout.print("\r  Sent: {d}/{d} | Discovered: {d}   ", .{ sent, self.all_ips.len, discovered_count }) catch {};
@@ -541,16 +529,15 @@ const Scanner = struct {
             _ = self.poller.wait(10);
         }
 
-        // Wait for sender to finish. After this point no other thread touches
-        // the state, so the mutex is no longer needed.
+        // Wait for sender to finish
         sender.join();
 
-        stdout.print("\r  Discovered: {d} hosts                                      \n", .{state.discovered.count()}) catch {};
+        stdout.print("\r  Discovered: {d} hosts                                      \n", .{discovered.count()}) catch {};
 
         // Convert to array
         var alive_hosts = std.ArrayList([4]u8){};
         errdefer alive_hosts.deinit(self.allocator);
-        var iter = state.discovered.keyIterator();
+        var iter = discovered.keyIterator();
         while (iter.next()) |key| {
             try alive_hosts.append(self.allocator, u32ToIp(key.*));
         }
@@ -615,7 +602,6 @@ const Scanner = struct {
         var last_send_time: i64 = 0;
         var last_response_time: i64 = 0;
         var all_sent = false;
-        const phase_start = std.time.microTimestamp();
 
         var recv_buf: [1024]u8 align(4) = undefined;
         var packet: [64]u8 align(4) = undefined;
@@ -636,8 +622,10 @@ const Scanner = struct {
             if (all_sent) {
                 // Adaptive exit: no responses for a while
                 if (last_response_time > 0 and (now - last_response_time) > adaptive_timeout_us) break;
-                // Hard timeout
-                if ((now - phase_start) > max_timeout_us) break;
+                // Hard timeout, measured from the last send so the final
+                // round still gets its full reply window (-t is the timeout
+                // per ping, and sending alone can take longer than -t)
+                if ((now - last_send_time) > max_timeout_us) break;
                 // All responses received
                 if (responses_received >= total_pings) break;
             }
@@ -858,6 +846,7 @@ fn displayWidth(s: []const u8) usize {
 fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: usize) void {
     const reset = "\x1b[0m";
     const col_width = 28; // Fixed column width for alignment
+    const spaces = " " ** col_width;
 
     stdout.print("\n", .{}) catch {};
 
@@ -865,14 +854,11 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
     while (row_start < results.len) {
         const row_end = @min(row_start + width, results.len);
 
-        // Print IP labels for this row (left-padded to col_width)
+        // Print IP labels for this row (padded to col_width)
         for (results[row_start..row_end]) |r| {
             var buf: [16]u8 = undefined;
             const ip_str = ipToString(r.ip, &buf);
-            stdout.print("{s}", .{ip_str}) catch {};
-            for (0..(col_width - ip_str.len)) |_| {
-                stdout.print(" ", .{}) catch {};
-            }
+            stdout.print("{s}{s}", .{ ip_str, spaces[0 .. col_width - ip_str.len] }) catch {};
         }
         stdout.print("\n", .{}) catch {};
 
@@ -903,13 +889,8 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
             stdout.print("{s}{s}{s} {s}", .{ block_color, block, reset, combined_str }) catch {};
             // 2 display chars for "█ ", rest is latency string (use display width for proper alignment)
             const used = 2 + displayWidth(combined_str);
-            if (used < col_width) {
-                for (0..(col_width - used)) |_| {
-                    stdout.print(" ", .{}) catch {};
-                }
-            } else {
-                stdout.print(" ", .{}) catch {}; // At least one space between columns
-            }
+            const pad = if (used < col_width) col_width - used else 1; // At least one space between columns
+            stdout.print("{s}", .{spaces[0..pad]}) catch {};
         }
         stdout.print("\n\n", .{}) catch {};
 
@@ -991,17 +972,23 @@ fn printLegend(stdout: StdoutWriter) void {
 fn printProgress(stdout: StdoutWriter, done: usize, total: usize) void {
     const percent = @as(f64, @floatFromInt(done)) / @as(f64, @floatFromInt(total)) * 100.0;
     const bar_width: usize = 40;
-    const filled = @as(usize, @intFromFloat(@as(f64, @floatFromInt(bar_width)) * percent / 100.0));
+    // Explicit type: @min with a comptime-known bound would otherwise
+    // narrow the result to u6, and filled * 3 overflows u6
+    const filled: usize = @min(bar_width, @as(usize, @intFromFloat(@as(f64, @floatFromInt(bar_width)) * percent / 100.0)));
 
-    stdout.print("\r  Measuring: [", .{}) catch {};
-    for (0..bar_width) |i| {
-        if (i < filled) {
-            stdout.print("█", .{}) catch {};
-        } else {
-            stdout.print("░", .{}) catch {};
-        }
-    }
-    stdout.print("] {d:.1}% ({d}/{d})", .{ percent, done, total }) catch {};
+    // Each block is 3 bytes of UTF-8; slice pre-built runs so the whole
+    // update is a single write (stdout is unbuffered)
+    const full_blocks = "█" ** bar_width;
+    const empty_blocks = "░" ** bar_width;
+    var buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "\r  Measuring: [{s}{s}] {d:.1}% ({d}/{d})", .{
+        full_blocks[0 .. filled * 3],
+        empty_blocks[0 .. (bar_width - filled) * 3],
+        percent,
+        done,
+        total,
+    }) catch return;
+    stdout.print("{s}", .{line}) catch {};
 }
 
 fn parseSubnet(arg: []const u8) ?struct { subnet: [4]u8, mask: u8 } {
@@ -1112,8 +1099,11 @@ pub fn main() !void {
             const value = nextArgValue(args, &i);
             config.latency_timeout_ms = std.fmt.parseInt(u32, value, 10) catch
                 return invalidArgValue("-t", value);
-        } else if (!subnet_set and parseSubnet(arg) != null) {
-            const parsed = parseSubnet(arg).?;
+        } else if (!subnet_set) {
+            const parsed = parseSubnet(arg) orelse {
+                std.debug.print("Error: unrecognized argument '{s}' (see --help)\n", .{arg});
+                std.process.exit(1);
+            };
             config.subnet = parsed.subnet;
             config.mask_bits = parsed.mask;
             subnet_set = true;
@@ -1172,9 +1162,7 @@ pub fn main() !void {
     // Sort discovered hosts by IP
     std.mem.sort([4]u8, alive_hosts.items, {}, struct {
         fn lessThan(_: void, a: [4]u8, b: [4]u8) bool {
-            const a_num: u32 = @as(u32, a[0]) << 24 | @as(u32, a[1]) << 16 | @as(u32, a[2]) << 8 | @as(u32, a[3]);
-            const b_num: u32 = @as(u32, b[0]) << 24 | @as(u32, b[1]) << 16 | @as(u32, b[2]) << 8 | @as(u32, b[3]);
-            return a_num < b_num;
+            return ipToU32(a) < ipToU32(b);
         }
     }.lessThan);
 
