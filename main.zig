@@ -151,6 +151,68 @@ const SocketPoller = struct {
     }
 };
 
+// Kernel receive timestamps: with SO_TIMESTAMP enabled, the kernel records
+// each packet's arrival time as it enters the network stack and delivers it
+// via recvmsg ancillary data (SCM_TIMESTAMP + struct timeval). Using that
+// instead of a userspace timestamp removes poller wakeup, scheduling, and
+// drain-queue delay in this process from measured RTTs. The timestamp is in
+// the realtime clock domain, the same clock as std.time.microTimestamp(),
+// so it is directly comparable to our send timestamps.
+//
+// Supported on Linux and Apple platforms; elsewhere (or if setsockopt
+// fails) receive times fall back to userspace timestamps.
+const kernel_ts = struct {
+    const supported = SocketPoller.is_linux or builtin.os.tag.isDarwin();
+
+    const level: i32 = @intCast(posix.SOL.SOCKET);
+
+    // Socket option that enables timestamps, and the cmsg type carrying them.
+    // On Linux SCM_TIMESTAMP == SO_TIMESTAMP; on Darwin it is 0x02. Zig's
+    // std doesn't expose SO_TIMESTAMP for Darwin, so use the XNU value.
+    const sockopt: u32 = if (SocketPoller.is_linux)
+        std.os.linux.SO.TIMESTAMP_OLD
+    else
+        0x0400; // SO_TIMESTAMP from xnu bsd/sys/socket.h
+    const scm_type: i32 = if (SocketPoller.is_linux) @intCast(std.os.linux.SO.TIMESTAMP_OLD) else 0x02;
+
+    // cmsghdr layout differs: Linux aligns the header and each entry to
+    // @sizeOf(usize) and uses a usize length; Apple platforms align to 4
+    // bytes (__DARWIN_ALIGN32) and use a u32 length.
+    const CmsgHdr = if (SocketPoller.is_linux) extern struct {
+        len: usize,
+        level: i32,
+        type: i32,
+    } else extern struct {
+        len: u32,
+        level: i32,
+        type: i32,
+    };
+    const alignment: usize = if (SocketPoller.is_linux) @sizeOf(usize) else 4;
+    const data_offset: usize = std.mem.alignForward(usize, @sizeOf(CmsgHdr), alignment);
+
+    // Parse SCM_TIMESTAMP out of a recvmsg control buffer. Returns µs since
+    // epoch (same clock as std.time.microTimestamp) or null if absent.
+    fn parse(control: []const u8) ?i64 {
+        var off: usize = 0;
+        while (off + @sizeOf(CmsgHdr) <= control.len) {
+            // Copy the header out: entries after the first may not be
+            // aligned for a direct pointer cast
+            var hdr: CmsgHdr = undefined;
+            @memcpy(std.mem.asBytes(&hdr), control[off..][0..@sizeOf(CmsgHdr)]);
+            const cmsg_len: usize = @intCast(hdr.len);
+            if (cmsg_len < @sizeOf(CmsgHdr) or off + cmsg_len > control.len) return null;
+            if (hdr.level == level and hdr.type == scm_type and
+                cmsg_len >= data_offset + @sizeOf(posix.timeval))
+            {
+                const tv = std.mem.bytesToValue(posix.timeval, control[off + data_offset ..][0..@sizeOf(posix.timeval)]);
+                return @as(i64, @intCast(tv.sec)) * std.time.us_per_s + @as(i64, @intCast(tv.usec));
+            }
+            off += std.mem.alignForward(usize, cmsg_len, alignment);
+        }
+        return null;
+    }
+};
+
 const IcmpHeader = extern struct {
     type: u8,
     code: u8,
@@ -262,6 +324,14 @@ fn u32ToIp(val: u32) [4]u8 {
     };
 }
 
+// Monotonic clock in µs: immune to NTP steps and slews of the wall clock.
+// Used for all pacing/timeouts and as the step-safe RTT measurement; the
+// wall clock is only consulted to compare against kernel receive stamps.
+fn monotonicMicros() i64 {
+    const ts = posix.clock_gettime(.MONOTONIC) catch return std.time.microTimestamp();
+    return @as(i64, @intCast(ts.sec)) * std.time.us_per_s + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_us);
+}
+
 // State shared between the sender thread and the main (receiver) thread.
 // Only the atomics are written by the sender; everything else is read-only.
 const ScanState = struct {
@@ -340,6 +410,7 @@ const Scanner = struct {
     config: Config,
     is_raw_socket: bool,
     magic: [4]u8,
+    kernel_ts_enabled: bool,
 
     // Payload tag written into every echo request and checked on every reply,
     // so replies to other processes' pings (a raw ICMP socket sees them all)
@@ -376,6 +447,14 @@ const Scanner = struct {
         const o_nonblock: FlagsInt = @bitCast(posix.O{ .NONBLOCK = true });
         _ = try posix.fcntl(sock, posix.F.SETFL, flags | o_nonblock);
 
+        // Ask the kernel to stamp arrival times on received packets so RTT
+        // measurement doesn't include our own wakeup/scheduling delay
+        var ts_enabled = false;
+        if (kernel_ts.supported) {
+            const one: c_int = 1;
+            ts_enabled = c.setsockopt(sock, kernel_ts.level, kernel_ts.sockopt, &one, @sizeOf(c_int)) == 0;
+        }
+
         // Create event poller for efficient socket waiting
         const poller = try SocketPoller.init(sock);
 
@@ -391,7 +470,38 @@ const Scanner = struct {
             .config = config,
             .is_raw_socket = true,
             .magic = magic,
+            .kernel_ts_enabled = ts_enabled,
         };
+    }
+
+    const RecvPacket = struct {
+        len: usize,
+        src: posix.sockaddr.in,
+        kernel_ts_us: ?i64, // Kernel arrival time, null if unavailable
+    };
+
+    // Receive one packet along with its kernel arrival timestamp (if enabled)
+    fn recvPacket(self: *Scanner, buf: []u8) ?RecvPacket {
+        var src: posix.sockaddr.in = undefined;
+        var iov = [_]posix.iovec{.{ .base = buf.ptr, .len = buf.len }};
+        var control: [64]u8 align(8) = undefined;
+        var msg = std.mem.zeroes(c.msghdr);
+        msg.name = @ptrCast(&src);
+        msg.namelen = @sizeOf(posix.sockaddr.in);
+        msg.iov = &iov;
+        msg.iovlen = 1;
+        msg.control = &control;
+        msg.controllen = @intCast(control.len);
+
+        const rc = c.recvmsg(self.sock, &msg, c.MSG.DONTWAIT);
+        if (rc < 0) return null;
+
+        const controllen: usize = @intCast(msg.controllen);
+        const ts = if (self.kernel_ts_enabled)
+            kernel_ts.parse(control[0..@min(controllen, control.len)])
+        else
+            null;
+        return .{ .len = @intCast(rc), .src = src, .kernel_ts_us = ts };
     }
 
     pub fn deinit(self: *Scanner) void {
@@ -439,23 +549,8 @@ const Scanner = struct {
         while (true) {
             // Drain all available packets first
             while (true) {
-                var src_addr_c: posix.sockaddr.in = undefined;
-                var addr_len_c: c.socklen_t = @sizeOf(posix.sockaddr.in);
-                const recv_rc = c.recvfrom(
-                    self.sock,
-                    &recv_buf,
-                    recv_buf.len,
-                    c.MSG.DONTWAIT,
-                    @ptrCast(&src_addr_c),
-                    &addr_len_c,
-                );
-
-                if (recv_rc < 0) {
-                    // No more packets available
-                    break;
-                }
-
-                const recv_len: usize = @intCast(recv_rc);
+                const pkt = self.recvPacket(&recv_buf) orelse break;
+                const recv_len = pkt.len;
 
                 // Parse ICMP reply - DGRAM sockets don't have IP header, RAW sockets do
                 var icmp_offset: usize = 0;
@@ -473,7 +568,7 @@ const Scanner = struct {
                 if (!std.mem.eql(u8, recv_buf[payload_off..][0..4], &magic)) continue;
 
                 // Record this host as alive (if it's in the scanned range)
-                const src_ip_bytes: [4]u8 = @bitCast(src_addr_c.addr);
+                const src_ip_bytes: [4]u8 = @bitCast(pkt.src.addr);
                 const src_ip_key = ipToU32(src_ip_bytes);
                 if ((src_ip_key & netmask) != network) continue;
 
@@ -481,7 +576,7 @@ const Scanner = struct {
             }
 
             // Now check exit conditions and update progress
-            const now = std.time.microTimestamp();
+            const now = monotonicMicros();
             const sender_done = state.sender_done.load(.seq_cst);
 
             // Record when sender finishes
@@ -568,11 +663,14 @@ const Scanner = struct {
         defer self.allocator.free(latencies);
         for (latencies) |*lat| lat.* = LatencyData.init();
 
-        // Allocate send times for ALL pings (hosts * rounds)
+        // Send times for ALL pings (hosts * rounds), in both clock domains:
+        // monotonic for the step-immune measurement, wall clock to compare
+        // against kernel receive stamps (which are wall clock only)
+        const SendTime = struct { mono: i64, real: i64 };
         const total_pings = hosts.len * num_rounds;
-        const send_times = try self.allocator.alloc(i64, total_pings);
+        const send_times = try self.allocator.alloc(SendTime, total_pings);
         defer self.allocator.free(send_times);
-        @memset(send_times, 0);
+        @memset(send_times, .{ .mono = 0, .real = 0 });
 
         // Track which pings have been received
         const received = try self.allocator.alloc(bool, total_pings);
@@ -601,6 +699,7 @@ const Scanner = struct {
         var next_send_round: usize = 0;
         var last_send_time: i64 = 0;
         var last_response_time: i64 = 0;
+        var last_progress_print: i64 = 0;
         var all_sent = false;
 
         var recv_buf: [1024]u8 align(4) = undefined;
@@ -616,7 +715,7 @@ const Scanner = struct {
 
         // Event loop: interleave sending and receiving
         while (true) {
-            const now = std.time.microTimestamp();
+            const now = monotonicMicros();
 
             // Check exit conditions
             if (all_sent) {
@@ -645,8 +744,8 @@ const Scanner = struct {
                 header.checksum = 0;
                 header.checksum = calculateChecksum(&packet);
 
-                // Record send time IMMEDIATELY before send
-                const send_time = std.time.microTimestamp();
+                // Record send time IMMEDIATELY before send, in both domains
+                const send_time = SendTime{ .mono = monotonicMicros(), .real = std.time.microTimestamp() };
                 send_times[ping_idx] = send_time;
 
                 _ = c.sendto(
@@ -658,7 +757,7 @@ const Scanner = struct {
                     @sizeOf(posix.sockaddr.in),
                 );
 
-                last_send_time = send_time;
+                last_send_time = send_time.mono;
 
                 // Advance to next ping
                 next_send_host += 1;
@@ -678,23 +777,13 @@ const Scanner = struct {
             if (has_data) {
                 // Drain ALL available packets immediately
                 while (true) {
-                    // Get timestamp BEFORE reading to minimize latency measurement error
-                    const recv_time = std.time.microTimestamp();
+                    // Monotonic timestamp taken BEFORE reading: the packet
+                    // has already arrived, so this is an upper bound on the
+                    // true RTT that is immune to wall-clock steps
+                    const recv_mono = monotonicMicros();
 
-                    var src_addr_c: posix.sockaddr.in = undefined;
-                    var addr_len_c: c.socklen_t = @sizeOf(posix.sockaddr.in);
-                    const recv_rc = c.recvfrom(
-                        self.sock,
-                        &recv_buf,
-                        recv_buf.len,
-                        c.MSG.DONTWAIT,
-                        @ptrCast(&src_addr_c),
-                        &addr_len_c,
-                    );
-
-                    if (recv_rc < 0) break; // No more packets
-
-                    const recv_len: usize = @intCast(recv_rc);
+                    const pkt = self.recvPacket(&recv_buf) orelse break;
+                    const recv_len = pkt.len;
 
                     // Parse ICMP reply - skip IP header for raw socket
                     var icmp_offset: usize = 0;
@@ -720,16 +809,36 @@ const Scanner = struct {
                     if (ping_idx >= total_pings or received[ping_idx]) continue;
 
                     const send_time = send_times[ping_idx];
-                    if (send_time == 0) continue; // Not sent yet (shouldn't happen)
+                    if (send_time.mono == 0) continue; // Not sent yet (shouldn't happen)
 
-                    const latency: u64 = @intCast(@max(0, recv_time - send_time));
+                    // Step-immune measurement from the monotonic clock
+                    const mono_rtt = recv_mono - send_time.mono;
+
+                    // Prefer the kernel's arrival stamp — it excludes our
+                    // wakeup/scheduling/drain delay — but the kernel only
+                    // offers it in the wall-clock domain, so accept it only
+                    // when consistent with the monotonic bound (a wall-clock
+                    // step mid-flight would otherwise corrupt the sample)
+                    var rtt = mono_rtt;
+                    if (pkt.kernel_ts_us) |kernel_time| {
+                        const kernel_rtt = kernel_time - send_time.real;
+                        if (kernel_rtt >= 0 and kernel_rtt <= mono_rtt) rtt = kernel_rtt;
+                    }
+
+                    const latency: u64 = @intCast(@max(0, rtt));
                     latencies[host_idx].add(latency);
                     received[ping_idx] = true;
                     responses_received += 1;
-                    last_response_time = recv_time;
+                    last_response_time = recv_mono;
                 }
 
-                printProgress(stdout, responses_received, total_pings);
+                // Throttle progress output: stdout is unbuffered, so each
+                // update is a blocking write syscall that would otherwise
+                // sit in the receive path and delay fallback timestamps
+                if (now - last_progress_print > 100_000) {
+                    last_progress_print = now;
+                    printProgress(stdout, responses_received, total_pings);
+                }
             } else if (all_sent) {
                 // No data available and all sent - wait with short timeout
                 _ = self.poller.wait(10);
@@ -740,6 +849,8 @@ const Scanner = struct {
             }
         }
 
+        // Final progress line (updates were throttled during the loop)
+        printProgress(stdout, responses_received, total_pings);
         stdout.print("\n", .{}) catch {};
 
         // Copy results
@@ -1138,7 +1249,7 @@ pub fn main() !void {
     const all_ips = try generateIpRange(allocator, config.subnet, config.mask_bits);
     defer allocator.free(all_ips);
 
-    stdout.print("  Total IPs to scan: {d}\n\n", .{all_ips.len}) catch {};
+    stdout.print("  Total IPs to scan: {d}\n", .{all_ips.len}) catch {};
 
     // Two-phase scanner
     var scanner = Scanner.init(allocator, all_ips, config) catch |err| {
@@ -1148,6 +1259,10 @@ pub fn main() !void {
         return err;
     };
     defer scanner.deinit();
+
+    stdout.print("  Receive timestamps: {s}\n\n", .{
+        if (scanner.kernel_ts_enabled) "kernel (SO_TIMESTAMP)" else "userspace (kernel timestamps unavailable)",
+    }) catch {};
 
     // Phase 1: Discovery
     var alive_hosts = try scanner.discover(stdout);
@@ -1247,6 +1362,68 @@ test "displayWidth ignores ANSI escapes and counts multi-byte chars once" {
     try testing.expectEqual(@as(usize, 3), displayWidth("abc"));
     try testing.expectEqual(@as(usize, 5), displayWidth("\x1b[92m1.2ms\x1b[0m"));
     try testing.expectEqual(@as(usize, 5), displayWidth("123µs"));
+}
+
+test "monotonicMicros is nondecreasing" {
+    const a = monotonicMicros();
+    const b = monotonicMicros();
+    try testing.expect(b >= a);
+    try testing.expect(a > 0);
+}
+
+test "kernel_ts.parse extracts SCM_TIMESTAMP, skipping unrelated cmsgs" {
+    var buf: [96]u8 align(8) = @splat(0);
+    var off: usize = 0;
+
+    // Unrelated cmsg first (wrong type) with 4 bytes of data
+    {
+        const hdr = kernel_ts.CmsgHdr{
+            .len = @intCast(kernel_ts.data_offset + 4),
+            .level = kernel_ts.level,
+            .type = kernel_ts.scm_type + 1,
+        };
+        @memcpy(buf[off..][0..@sizeOf(kernel_ts.CmsgHdr)], std.mem.asBytes(&hdr));
+        off += std.mem.alignForward(usize, @as(usize, @intCast(hdr.len)), kernel_ts.alignment);
+    }
+
+    // The timestamp cmsg
+    {
+        const tv = posix.timeval{ .sec = 12, .usec = 345678 };
+        const hdr = kernel_ts.CmsgHdr{
+            .len = @intCast(kernel_ts.data_offset + @sizeOf(posix.timeval)),
+            .level = kernel_ts.level,
+            .type = kernel_ts.scm_type,
+        };
+        @memcpy(buf[off..][0..@sizeOf(kernel_ts.CmsgHdr)], std.mem.asBytes(&hdr));
+        @memcpy(buf[off + kernel_ts.data_offset ..][0..@sizeOf(posix.timeval)], std.mem.asBytes(&tv));
+        off += std.mem.alignForward(usize, @as(usize, @intCast(hdr.len)), kernel_ts.alignment);
+    }
+
+    try testing.expectEqual(@as(?i64, 12_345_678), kernel_ts.parse(buf[0..off]));
+}
+
+test "kernel_ts.parse rejects empty, truncated, and mismatched buffers" {
+    try testing.expectEqual(@as(?i64, null), kernel_ts.parse(&.{}));
+
+    // Header alone, no timeval payload
+    var short: [@sizeOf(kernel_ts.CmsgHdr)]u8 align(8) = undefined;
+    const hdr = kernel_ts.CmsgHdr{
+        .len = @intCast(@sizeOf(kernel_ts.CmsgHdr)),
+        .level = kernel_ts.level,
+        .type = kernel_ts.scm_type,
+    };
+    @memcpy(&short, std.mem.asBytes(&hdr));
+    try testing.expectEqual(@as(?i64, null), kernel_ts.parse(&short));
+
+    // Length claims more data than the buffer holds
+    var lying: [@sizeOf(kernel_ts.CmsgHdr)]u8 align(8) = undefined;
+    const bad = kernel_ts.CmsgHdr{
+        .len = @intCast(@sizeOf(kernel_ts.CmsgHdr) + 64),
+        .level = kernel_ts.level,
+        .type = kernel_ts.scm_type,
+    };
+    @memcpy(&lying, std.mem.asBytes(&bad));
+    try testing.expectEqual(@as(?i64, null), kernel_ts.parse(&lying));
 }
 
 test "LatencyData caps samples and computes min/avg/max" {
