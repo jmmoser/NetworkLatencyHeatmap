@@ -5,6 +5,7 @@ A fast network scanner that discovers hosts on your network and measures their l
 ## Features
 
 - **Two-phase scanning**: Fast discovery phase followed by accurate latency measurement
+- **Kernel receive timestamps**: Uses `SO_TIMESTAMP` so replies are stamped by the kernel on arrival — process wakeup and scheduling delay don't inflate measured RTTs (falls back to userspace timestamps where unavailable)
 - **Visual heatmap**: Color-coded latency display to quickly identify slow devices
 - **Concurrent scanning**: Uses separate sender/receiver threads for maximum throughput
 - **Large subnet support**: Can scan /16 networks (65k+ hosts) efficiently
@@ -67,8 +68,11 @@ sudo ./zig-out/bin/latency-heatmap 10.0.0.0/24 -p 1
 
 2. **Phase 2: Latency Measurement**
    - For each discovered host, sends multiple pings
-   - Records minimum latency for each host
+   - Reply arrival times come from kernel timestamps (`SCM_TIMESTAMP`), not userspace clocks, so scheduling jitter is excluded from the samples
+   - Records min/avg/max latency for each host
    - Displays results with color-coded heatmap
+
+The phases are deliberately sequential: latency is measured in a quiet window after the discovery blast, so probes never compete with the scanner's own traffic for the NIC and socket buffers.
 
 ## Heatmap Legend
 
