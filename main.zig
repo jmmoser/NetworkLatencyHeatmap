@@ -91,25 +91,30 @@ const SocketPoller = struct {
 
     pub fn init(sock: posix.fd_t) !SocketPoller {
         if (is_darwin) {
-            const kq = try posix.kqueue();
+            const kq = c.kqueue();
+            if (kq < 0) return error.PollerInitFailed;
             // Register socket for read events
-            var changelist = [_]posix.Kevent{.{
+            const changelist = [_]c.Kevent{.{
                 .ident = @intCast(sock),
-                .filter = posix.system.EVFILT.READ,
-                .flags = posix.system.EV.ADD,
+                .filter = c.EVFILT.READ,
+                .flags = c.EV.ADD,
                 .fflags = 0,
                 .data = 0,
                 .udata = 0,
             }};
-            _ = try posix.kevent(kq, &changelist, &[_]posix.Kevent{}, null);
+            var events: [1]c.Kevent = undefined;
+            if (c.kevent(kq, &changelist, changelist.len, &events, 0, null) < 0)
+                return error.PollerInitFailed;
             return .{ .fd = kq, .sock = sock };
         } else if (is_linux) {
-            const epfd = try posix.epoll_create1(0);
+            const epfd = c.epoll_create1(0);
+            if (epfd < 0) return error.PollerInitFailed;
             var ev = std.os.linux.epoll_event{
                 .events = std.os.linux.EPOLL.IN,
                 .data = .{ .fd = sock },
             };
-            try posix.epoll_ctl(epfd, std.os.linux.EPOLL.CTL_ADD, sock, &ev);
+            if (c.epoll_ctl(epfd, std.os.linux.EPOLL.CTL_ADD, sock, &ev) < 0)
+                return error.PollerInitFailed;
             return .{ .fd = epfd, .sock = sock };
         } else {
             // Fallback: no event fd, will use polling
@@ -119,7 +124,7 @@ const SocketPoller = struct {
 
     pub fn deinit(self: *SocketPoller) void {
         if (self.fd >= 0) {
-            posix.close(self.fd);
+            _ = c.close(self.fd);
         }
     }
 
@@ -127,21 +132,23 @@ const SocketPoller = struct {
     // timeout_ms: max time to wait in milliseconds
     pub fn wait(self: *SocketPoller, timeout_ms: u32) bool {
         if (is_darwin) {
-            const timeout = posix.timespec{
+            const timeout = c.timespec{
                 .sec = @intCast(timeout_ms / 1000),
                 .nsec = @intCast((timeout_ms % 1000) * 1_000_000),
             };
-            var events: [1]posix.Kevent = undefined;
-            const n = posix.kevent(self.fd, &[_]posix.Kevent{}, &events, &timeout) catch return false;
+            var events: [1]c.Kevent = undefined;
+            const n = c.kevent(self.fd, &[_]c.Kevent{}, 0, &events, events.len, &timeout);
             return n > 0;
         } else if (is_linux) {
             var events: [1]std.os.linux.epoll_event = undefined;
-            const n = posix.epoll_wait(self.fd, &events, @intCast(timeout_ms));
+            const n = c.epoll_wait(self.fd, &events, events.len, @intCast(timeout_ms));
             return n > 0;
         } else {
-            // Fallback: simple sleep-based polling
-            std.Thread.sleep(timeout_ms * std.time.ns_per_ms);
-            return true; // Assume data might be available
+            // Fallback: block in poll(2) until the socket is readable or the
+            // timeout elapses.
+            var fds = [_]posix.pollfd{.{ .fd = self.sock, .events = posix.POLL.IN, .revents = 0 }};
+            const n = posix.poll(&fds, @intCast(timeout_ms)) catch return false;
+            return n > 0;
         }
     }
 
@@ -327,9 +334,28 @@ fn u32ToIp(val: u32) [4]u8 {
 // Monotonic clock in µs: immune to NTP steps and slews of the wall clock.
 // Used for all pacing/timeouts and as the step-safe RTT measurement; the
 // wall clock is only consulted to compare against kernel receive stamps.
-fn monotonicMicros() i64 {
-    const ts = posix.clock_gettime(.MONOTONIC) catch return std.time.microTimestamp();
+fn clockMicros(clk: c.clockid_t) i64 {
+    var ts: c.timespec = undefined;
+    if (c.clock_gettime(clk, &ts) != 0) return 0;
     return @as(i64, @intCast(ts.sec)) * std.time.us_per_s + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_us);
+}
+
+fn monotonicMicros() i64 {
+    return clockMicros(.MONOTONIC);
+}
+
+// Wall clock in µs since the Unix epoch, the same clock domain as the
+// kernel's SO_TIMESTAMP receive stamps.
+fn wallMicros() i64 {
+    return clockMicros(.REALTIME);
+}
+
+fn sleepNanos(ns: u64) void {
+    var req: c.timespec = .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    _ = c.nanosleep(&req, null);
 }
 
 // State shared between the sender thread and the main (receiver) thread.
@@ -392,7 +418,7 @@ fn senderThread(state: *ScanState) void {
                 err == @intFromEnum(posix.E.AGAIN);
             if (!buffer_full or tries >= 100) break;
             tries += 1;
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            sleepNanos(1 * std.time.ns_per_ms);
         }
 
         _ = state.sent_count.fetchAdd(1, .seq_cst);
@@ -442,10 +468,12 @@ const Scanner = struct {
         // Set socket to non-blocking for receives
         // (O.NONBLOCK, not SOCK.NONBLOCK - the latter is a socket() creation
         // flag and is a different bit on some platforms, e.g. macOS)
-        const flags = try posix.fcntl(sock, posix.F.GETFL, 0);
+        const flags = c.fcntl(sock, posix.F.GETFL, @as(c_int, 0));
+        if (flags < 0) return error.SocketCreationFailed;
         const FlagsInt = std.meta.Int(.unsigned, @bitSizeOf(posix.O));
         const o_nonblock: FlagsInt = @bitCast(posix.O{ .NONBLOCK = true });
-        _ = try posix.fcntl(sock, posix.F.SETFL, flags | o_nonblock);
+        if (c.fcntl(sock, posix.F.SETFL, flags | @as(c_int, o_nonblock)) < 0)
+            return error.SocketCreationFailed;
 
         // Ask the kernel to stamp arrival times on received packets so RTT
         // measurement doesn't include our own wakeup/scheduling delay
@@ -506,7 +534,7 @@ const Scanner = struct {
 
     pub fn deinit(self: *Scanner) void {
         self.poller.deinit();
-        posix.close(self.sock);
+        _ = c.close(self.sock);
     }
 
     // Phase 1: Discovery - sender thread + receiver in main thread
@@ -630,7 +658,7 @@ const Scanner = struct {
         stdout.print("\r  Discovered: {d} hosts                                      \n", .{discovered.count()}) catch {};
 
         // Convert to array
-        var alive_hosts = std.ArrayList([4]u8){};
+        var alive_hosts: std.ArrayList([4]u8) = .empty;
         errdefer alive_hosts.deinit(self.allocator);
         var iter = discovered.keyIterator();
         while (iter.next()) |key| {
@@ -745,7 +773,7 @@ const Scanner = struct {
                 header.checksum = calculateChecksum(&packet);
 
                 // Record send time IMMEDIATELY before send, in both domains
-                const send_time = SendTime{ .mono = monotonicMicros(), .real = std.time.microTimestamp() };
+                const send_time = SendTime{ .mono = monotonicMicros(), .real = wallMicros() };
                 send_times[ping_idx] = send_time;
 
                 _ = c.sendto(
@@ -1128,7 +1156,7 @@ fn parseSubnet(arg: []const u8) ?struct { subnet: [4]u8, mask: u8 } {
     return .{ .subnet = u32ToIp(base), .mask = mask };
 }
 
-fn nextArgValue(args: []const [:0]u8, i: *usize) []const u8 {
+fn nextArgValue(args: []const [:0]const u8, i: *usize) []const u8 {
     if (i.* + 1 >= args.len) {
         std.debug.print("Error: {s} requires a value (see --help)\n", .{args[i.*]});
         std.process.exit(1);
@@ -1142,17 +1170,14 @@ fn invalidArgValue(flag: []const u8, value: []const u8) noreturn {
     std.process.exit(1);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     // Get unbuffered stdout writer for immediate output (pass empty slice for unbuffered)
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &.{});
     const stdout = &stdout_writer.interface;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     // Detect local subnet, fall back to 192.168.1.0/24
     var config = if (detectLocalSubnet()) |detected|
