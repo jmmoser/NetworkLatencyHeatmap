@@ -903,6 +903,11 @@ const Scanner = struct {
                     const reply_round: usize = icmp_reply.sequence;
                     if (host_idx >= hosts.len or reply_round >= num_rounds) continue;
 
+                    // The reply must come from the address that was pinged:
+                    // id/sequence alone would credit a stray or duplicated
+                    // reply to whichever host the id happens to index
+                    if (pkt.src.addr != dest_addrs[host_idx].addr) continue;
+
                     const ping_idx = host_idx * num_rounds + reply_round;
                     if (ping_idx >= total_pings or received[ping_idx]) continue;
 
