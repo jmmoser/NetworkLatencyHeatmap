@@ -13,8 +13,8 @@
 // answers a SYN with either SYN-ACK or RST.
 const std = @import("std");
 const posix = std.posix;
-const c = std.c;
 const common = @import("common.zig");
+const plat = @import("plat.zig");
 
 // Cap on --tcp-ping targets and on one probe batch (peers + extras)
 pub const max_targets = 16;
@@ -91,21 +91,6 @@ pub const ProbeStats = struct {
     }
 };
 
-fn setNonblocking(fd: posix.fd_t) bool {
-    const flags = c.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
-    if (flags < 0) return false;
-    const FlagsInt = std.meta.Int(.unsigned, @bitSizeOf(posix.O));
-    const o_nonblock: FlagsInt = @bitCast(posix.O{ .NONBLOCK = true });
-    return c.fcntl(fd, posix.F.SETFL, flags | @as(c_int, o_nonblock)) >= 0;
-}
-
-// Abortive close: RST with a zero window instead of FIN/ACK teardown
-fn rstClose(fd: posix.fd_t) void {
-    const lo = c.linger{ .onoff = 1, .linger = 0 };
-    _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.LINGER, &lo, @sizeOf(c.linger));
-    _ = c.close(fd);
-}
-
 fn clampRtt(delta_us: i64) u32 {
     return @intCast(std.math.clamp(delta_us, 0, std.math.maxInt(u32)));
 }
@@ -121,30 +106,29 @@ pub fn tcpProbeBatch(addrs: []const posix.sockaddr.in, results: []Outcome, timeo
     std.debug.assert(addrs.len == results.len);
     std.debug.assert(addrs.len <= max_batch);
 
-    var fds: [max_batch]posix.fd_t = undefined;
+    var fds: [max_batch]plat.Socket = undefined;
     var t0: [max_batch]i64 = undefined;
     var pending: [max_batch]bool = @splat(false);
 
     for (addrs, 0..) |*addr, i| {
         results[i] = .{ .rtt_us = null, .refused = false };
-        const fd_c = c.socket(posix.AF.INET, c.SOCK.STREAM, 0);
-        if (fd_c < 0) continue;
-        const fd: posix.fd_t = @intCast(fd_c);
-        if (!setNonblocking(fd)) {
-            _ = c.close(fd);
+        const fd = plat.openSocket(plat.AF_INET, plat.SOCK_STREAM, 0);
+        if (!plat.isValidSocket(fd)) continue;
+        if (!plat.setNonblocking(fd)) {
+            plat.closeSocket(fd);
             continue;
         }
         t0[i] = common.monotonicMicros();
-        const rc = c.connect(fd, @ptrCast(addr), @sizeOf(posix.sockaddr.in));
+        const rc = plat.connect(fd, addr, @sizeOf(posix.sockaddr.in));
         if (rc == 0) {
             // Connected synchronously (loopback / same host)
             results[i] = .{ .rtt_us = clampRtt(common.monotonicMicros() - t0[i]), .refused = false };
-            rstClose(fd);
+            plat.rstClose(fd);
             continue;
         }
-        if (std.c._errno().* != @intFromEnum(posix.E.INPROGRESS)) {
+        if (!plat.errConnectInProgress(plat.lastError())) {
             // No route, no buffers, ... — not a latency signal
-            _ = c.close(fd);
+            plat.closeSocket(fd);
             continue;
         }
         fds[i] = fd;
@@ -153,12 +137,12 @@ pub fn tcpProbeBatch(addrs: []const posix.sockaddr.in, results: []Outcome, timeo
 
     const deadline = common.monotonicMicros() + @as(i64, timeout_ms) * std.time.us_per_ms;
     while (true) {
-        var pfds: [max_batch]posix.pollfd = undefined;
+        var pfds: [max_batch]plat.Pollfd = undefined;
         var map: [max_batch]usize = undefined;
         var n: usize = 0;
         for (pending, 0..) |p, i| {
             if (!p) continue;
-            pfds[n] = .{ .fd = fds[i], .events = posix.POLL.OUT, .revents = 0 };
+            pfds[n] = .{ .fd = fds[i], .events = plat.POLL_OUT, .revents = 0 };
             map[n] = i;
             n += 1;
         }
@@ -166,13 +150,13 @@ pub fn tcpProbeBatch(addrs: []const posix.sockaddr.in, results: []Outcome, timeo
 
         const now = common.monotonicMicros();
         if (now >= deadline) break;
-        const wait_ms: c_int = @intCast(@min(
+        const wait_ms: i32 = @intCast(@min(
             @divFloor(deadline - now, std.time.us_per_ms) + 1,
             @as(i64, timeout_ms),
         ));
-        const rc = c.poll(&pfds, @intCast(n), wait_ms);
+        const rc = plat.poll(pfds[0..n], wait_ms);
         if (rc < 0) {
-            if (std.c._errno().* == @intFromEnum(posix.E.INTR)) continue;
+            if (plat.errInterrupted(plat.lastError())) continue;
             break;
         }
         if (rc == 0) break; // timed out
@@ -184,21 +168,19 @@ pub fn tcpProbeBatch(addrs: []const posix.sockaddr.in, results: []Outcome, timeo
             // POLLOUT with SO_ERROR 0 is a completed handshake (SYN-ACK
             // arrived); POLLERR/POLLHUP resolve through SO_ERROR too
             var soerr: c_int = 0;
-            var len: posix.socklen_t = @sizeOf(c_int);
-            _ = c.getsockopt(fds[i], posix.SOL.SOCKET, posix.SO.ERROR, &soerr, &len);
+            var len: u32 = @sizeOf(c_int);
+            _ = plat.getsockopt(fds[i], @intCast(posix.SOL.SOCKET), posix.SO.ERROR, &soerr, &len);
             const rtt = clampRtt(t1 - t0[i]);
             if (soerr == 0) {
                 results[i] = .{ .rtt_us = rtt, .refused = false };
-                rstClose(fds[i]);
-            } else if (soerr == @intFromEnum(posix.E.CONNREFUSED) or
-                soerr == @intFromEnum(posix.E.CONNRESET))
-            {
+                plat.rstClose(fds[i]);
+            } else if (plat.errConnRefusedOrReset(soerr)) {
                 // The RST came from the target's stack: RTT is still real
                 results[i] = .{ .rtt_us = rtt, .refused = true };
-                _ = c.close(fds[i]);
+                plat.closeSocket(fds[i]);
             } else {
                 // Unreachable / timed out in the stack: no sample
-                _ = c.close(fds[i]);
+                plat.closeSocket(fds[i]);
             }
             pending[i] = false;
         }
@@ -206,7 +188,7 @@ pub fn tcpProbeBatch(addrs: []const posix.sockaddr.in, results: []Outcome, timeo
 
     // Whatever never resolved: closing aborts the kernel's SYN retries
     for (pending, 0..) |p, i| {
-        if (p) _ = c.close(fds[i]);
+        if (p) plat.closeSocket(fds[i]);
     }
 }
 
@@ -261,19 +243,18 @@ test "tcpProbeBatch measures open and closed loopback ports" {
     const loopback = [4]u8{ 127, 0, 0, 1 };
 
     // Listener on an ephemeral port: probing it must yield a non-refused RTT
-    const lfd_c = c.socket(posix.AF.INET, c.SOCK.STREAM, 0);
-    try testing.expect(lfd_c >= 0);
-    const lfd: posix.fd_t = @intCast(lfd_c);
-    defer _ = c.close(lfd);
+    const lfd = plat.openSocket(plat.AF_INET, plat.SOCK_STREAM, 0);
+    try testing.expect(plat.isValidSocket(lfd));
+    defer plat.closeSocket(lfd);
     var laddr = posix.sockaddr.in{
         .family = posix.AF.INET,
         .port = 0,
         .addr = std.mem.bytesToValue(u32, &loopback),
     };
-    try testing.expect(c.bind(lfd, @ptrCast(&laddr), @sizeOf(posix.sockaddr.in)) == 0);
-    try testing.expect(c.listen(lfd, 4) == 0);
-    var llen: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-    try testing.expect(c.getsockname(lfd, @ptrCast(&laddr), &llen) == 0);
+    try testing.expect(plat.bind(lfd, &laddr, @sizeOf(posix.sockaddr.in)) == 0);
+    try testing.expect(plat.listen(lfd, 4) == 0);
+    var llen: u32 = @sizeOf(posix.sockaddr.in);
+    try testing.expect(plat.getsockname(lfd, &laddr, &llen) == 0);
 
     // A port that was just free: probing it must yield a refused RTT
     var closed_addr = posix.sockaddr.in{
@@ -282,13 +263,12 @@ test "tcpProbeBatch measures open and closed loopback ports" {
         .addr = std.mem.bytesToValue(u32, &loopback),
     };
     {
-        const tmp_c = c.socket(posix.AF.INET, c.SOCK.STREAM, 0);
-        try testing.expect(tmp_c >= 0);
-        const tmp: posix.fd_t = @intCast(tmp_c);
-        try testing.expect(c.bind(tmp, @ptrCast(&closed_addr), @sizeOf(posix.sockaddr.in)) == 0);
-        var clen: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-        try testing.expect(c.getsockname(tmp, @ptrCast(&closed_addr), &clen) == 0);
-        _ = c.close(tmp);
+        const tmp = plat.openSocket(plat.AF_INET, plat.SOCK_STREAM, 0);
+        try testing.expect(plat.isValidSocket(tmp));
+        try testing.expect(plat.bind(tmp, &closed_addr, @sizeOf(posix.sockaddr.in)) == 0);
+        var clen: u32 = @sizeOf(posix.sockaddr.in);
+        try testing.expect(plat.getsockname(tmp, &closed_addr, &clen) == 0);
+        plat.closeSocket(tmp);
     }
 
     const addrs = [2]posix.sockaddr.in{ laddr, closed_addr };

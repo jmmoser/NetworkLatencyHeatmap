@@ -10,5 +10,6 @@
         "common.zig",
         "mesh.zig",
         "probe.zig",
+        "plat.zig",
     },
 }

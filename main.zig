@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const common = @import("common.zig");
 const mesh_mod = @import("mesh.zig");
 const probe = @import("probe.zig");
+const plat = @import("plat.zig");
 
 const SocketPoller = common.SocketPoller;
 const PingResult = common.PingResult;
@@ -24,7 +25,8 @@ const displayWidth = common.displayWidth;
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
 
-// Network interface detection using getifaddrs
+// Network interface detection: getifaddrs on POSIX, GetIpAddrTable
+// (via plat.zig) on Windows
 const ifaddrs = extern struct {
     next: ?*ifaddrs,
     name: [*:0]const u8,
@@ -45,13 +47,12 @@ const IFF_RUNNING: c_uint = 0x40;
 // Local address the default route would use, found by connect()ing a UDP
 // socket to a public address (no packet is sent — connect on UDP only
 // selects the route) and reading back the chosen source address. Null when
-// there is no default route. Works unprivileged on Linux and macOS alike,
-// unlike parsing /proc/net/route or the PF_ROUTE sysctls.
+// there is no default route. Works unprivileged on every platform, unlike
+// parsing /proc/net/route or the PF_ROUTE sysctls.
 fn defaultRouteLocalAddr() ?u32 {
-    const fd = c.socket(posix.AF.INET, c.SOCK.DGRAM, 0);
-    if (fd < 0) return null;
-    const sock: posix.fd_t = @intCast(fd);
-    defer _ = c.close(sock);
+    const sock = plat.openSocket(plat.AF_INET, plat.SOCK_DGRAM, 0);
+    if (!plat.isValidSocket(sock)) return null;
+    defer plat.closeSocket(sock);
 
     const probe_ip = [4]u8{ 8, 8, 8, 8 };
     const dest = posix.sockaddr.in{
@@ -59,11 +60,11 @@ fn defaultRouteLocalAddr() ?u32 {
         .port = std.mem.nativeToBig(u16, 53),
         .addr = std.mem.bytesToValue(u32, &probe_ip),
     };
-    if (c.connect(sock, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) != 0) return null;
+    if (plat.connect(sock, &dest, @sizeOf(posix.sockaddr.in)) != 0) return null;
 
     var local: posix.sockaddr.in = undefined;
-    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-    if (c.getsockname(sock, @ptrCast(&local), &len) != 0) return null;
+    var len: u32 = @sizeOf(posix.sockaddr.in);
+    if (plat.getsockname(sock, &local, &len) != 0) return null;
     return local.addr;
 }
 
@@ -79,20 +80,51 @@ const DetectedSubnet = struct {
     }
 };
 
-// Pick the subnet to scan. Machines often have several eligible interfaces
-// (VPN tunnels, VM bridges, container networks), so prefer the one carrying
-// the default route; fall back to the first eligible interface when no
-// default route exists or its interface fails the eligibility checks.
-fn detectLocalSubnet() ?DetectedSubnet {
+const max_ifaces = 32;
+
+// One usable IPv4 interface address, however the platform enumerated it
+const IfaceEntry = struct {
+    addr_be: u32, // interface address, network byte order
+    mask_be: u32, // netmask, network byte order
+    name: [16]u8, // zero-padded
+    name_len: u8,
+};
+
+// Enumerate IPv4 interface addresses. Loopback and down interfaces are
+// already filtered out; everything else (link-local, weird masks) is left
+// to the caller's policy.
+fn collectIfaces(out: *[max_ifaces]IfaceEntry) usize {
+    if (plat.is_windows) {
+        var rows: [max_ifaces]plat.WinIface = undefined;
+        const n = plat.windowsListIfaces(&rows);
+        for (rows[0..n], 0..) |row, i| {
+            var e = IfaceEntry{
+                .addr_be = row.addr_be,
+                .mask_be = row.mask_be,
+                .name = @splat(0),
+                .name_len = 0,
+            };
+            // GetIpAddrTable has no interface names; show the index
+            const label = std.fmt.bufPrint(&e.name, "if{d}", .{row.index}) catch "";
+            e.name_len = @intCast(label.len);
+            out[i] = e;
+        }
+        return n;
+    } else {
+        return collectIfacesPosix(out);
+    }
+}
+
+fn collectIfacesPosix(out: *[max_ifaces]IfaceEntry) usize {
     var ifa_list: ?*ifaddrs = null;
-    if (getifaddrs(&ifa_list) != 0) return null;
+    if (getifaddrs(&ifa_list) != 0) return 0;
     defer if (ifa_list) |list| freeifaddrs(list);
 
-    const preferred_addr = defaultRouteLocalAddr();
-    var fallback: ?DetectedSubnet = null;
-
+    var count: usize = 0;
     var ifa = ifa_list;
     while (ifa) |iface| : (ifa = iface.next) {
+        if (count >= out.len) break;
+
         // Skip loopback and down interfaces
         if ((iface.flags & IFF_LOOPBACK) != 0) continue;
         if ((iface.flags & IFF_UP) == 0) continue;
@@ -105,13 +137,41 @@ fn detectLocalSubnet() ?DetectedSubnet {
         const netmask = iface.netmask orelse continue;
         if (netmask.family != posix.AF.INET) continue;
 
-        // Get the sockaddr_in pointers
         const addr_in: *const posix.sockaddr.in = @ptrCast(@alignCast(addr));
         const mask_in: *const posix.sockaddr.in = @ptrCast(@alignCast(netmask));
 
-        // Get IP address bytes (network byte order)
-        const ip_bytes: [4]u8 = @bitCast(addr_in.addr);
-        const mask_bytes: [4]u8 = @bitCast(mask_in.addr);
+        var e = IfaceEntry{
+            .addr_be = addr_in.addr,
+            .mask_be = mask_in.addr,
+            .name = @splat(0),
+            .name_len = 0,
+        };
+        const name_slice = std.mem.span(iface.name);
+        const take = @min(name_slice.len, e.name.len);
+        @memcpy(e.name[0..take], name_slice[0..take]);
+        e.name_len = @intCast(take);
+
+        out[count] = e;
+        count += 1;
+    }
+    return count;
+}
+
+// Pick the subnet to scan. Machines often have several eligible interfaces
+// (VPN tunnels, VM bridges, container networks), so prefer the one carrying
+// the default route; fall back to the first eligible interface when no
+// default route exists or its interface fails the eligibility checks.
+fn detectLocalSubnet() ?DetectedSubnet {
+    var entries: [max_ifaces]IfaceEntry = undefined;
+    const n = collectIfaces(&entries);
+
+    const preferred_addr = defaultRouteLocalAddr();
+    var fallback: ?DetectedSubnet = null;
+
+    for (entries[0..n]) |*e| {
+        // Address and mask bytes (network byte order)
+        const ip_bytes: [4]u8 = @bitCast(e.addr_be);
+        const mask_bytes: [4]u8 = @bitCast(e.mask_be);
 
         // Skip link-local addresses (169.254.x.x)
         if (ip_bytes[0] == 169 and ip_bytes[1] == 254) continue;
@@ -133,23 +193,39 @@ fn detectLocalSubnet() ?DetectedSubnet {
             ip_bytes[3] & mask_bytes[3],
         };
 
-        const is_preferred = preferred_addr != null and addr_in.addr == preferred_addr.?;
-        var detected = DetectedSubnet{
+        const is_preferred = preferred_addr != null and e.addr_be == preferred_addr.?;
+        const detected = DetectedSubnet{
             .subnet = subnet,
             .mask = mask_bits,
-            .ifname = @splat(0),
-            .ifname_len = 0,
+            .ifname = e.name,
+            .ifname_len = e.name_len,
             .on_default_route = is_preferred,
         };
-        const name_slice = std.mem.span(iface.name);
-        const take = @min(name_slice.len, detected.ifname.len);
-        @memcpy(detected.ifname[0..take], name_slice[0..take]);
-        detected.ifname_len = @intCast(take);
 
         if (is_preferred) return detected;
         if (fallback == null) fallback = detected;
     }
     return fallback;
+}
+
+// Windows only: a raw socket must be bound to a specific local address to
+// receive anything, so find the interface address on the scanned subnet,
+// falling back to the default route's address, then INADDR_ANY.
+fn rawSocketBindAddr(subnet: [4]u8, mask_bits: u8) u32 {
+    var entries: [max_ifaces]IfaceEntry = undefined;
+    const n = collectIfaces(&entries);
+
+    const netmask: u32 = if (mask_bits >= 32)
+        ~@as(u32, 0)
+    else
+        ~@as(u32, 0) << @intCast(32 - mask_bits);
+    const network = ipToU32(subnet) & netmask;
+
+    for (entries[0..n]) |*e| {
+        const ip = ipToU32(@as([4]u8, @bitCast(e.addr_be)));
+        if ((ip & netmask) == network) return e.addr_be;
+    }
+    return defaultRouteLocalAddr() orelse 0;
 }
 
 // Kernel receive timestamps: with SO_TIMESTAMP enabled, the kernel records
@@ -317,7 +393,7 @@ const ScanState = struct {
     sender_done: std.atomic.Value(bool),
 
     // Shared socket
-    sock: posix.fd_t,
+    sock: plat.Socket,
 
     // Payload tag identifying this run's discovery packets
     magic: [4]u8,
@@ -349,15 +425,14 @@ fn senderThread(state: *ScanState) void {
         @memcpy(packet[@sizeOf(IcmpHeader)..][0..4], &state.magic);
         header.checksum = calculateChecksum(&packet);
 
-        // Use C sendto directly to avoid Zig's panic on unknown errno (like macOS EHOSTDOWN=64)
+        // Raw sendto (not Zig's error-set wrappers) to avoid a panic on
+        // unknown errno (like macOS EHOSTDOWN=64)
         var tries: u32 = 0;
         while (true) {
-            const rc = c.sendto(
+            const rc = plat.sendto(
                 state.sock,
                 &packet,
-                packet.len,
-                0,
-                @ptrCast(&dest_addr),
+                &dest_addr,
                 @sizeOf(posix.sockaddr.in),
             );
             if (rc >= 0) break;
@@ -365,9 +440,8 @@ fn senderThread(state: *ScanState) void {
             // Blasting a subnet can fill the local send buffer; back off
             // briefly and retry so the host isn't silently skipped. Other
             // errors (host down, unreachable, ...) are expected and ignored.
-            const err = std.c._errno().*;
-            const buffer_full = err == @intFromEnum(posix.E.NOBUFS) or
-                err == @intFromEnum(posix.E.AGAIN);
+            const err = plat.lastError();
+            const buffer_full = plat.errNoBufs(err) or plat.errWouldBlock(err);
             if (!buffer_full or tries >= 100) break;
             tries += 1;
             sleepNanos(1 * std.time.ns_per_ms);
@@ -381,7 +455,7 @@ fn senderThread(state: *ScanState) void {
 
 // Two-phase scanner using threads
 const Scanner = struct {
-    sock: posix.fd_t,
+    sock: plat.Socket,
     poller: SocketPoller,
     allocator: std.mem.Allocator,
     all_ips: []const [4]u8,
@@ -420,30 +494,39 @@ const Scanner = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, all_ips: []const [4]u8, config: Config) !Scanner {
-        // Use RAW ICMP socket - requires sudo on macOS
-        // (DGRAM ICMP can send but cannot receive replies on macOS)
-        // Use C socket directly to handle macOS EPERM properly
-        const sock_fd = c.socket(posix.AF.INET, c.SOCK.RAW, posix.IPPROTO.ICMP);
-        if (sock_fd < 0) {
-            const err = std.c._errno().*;
-            if (err == 1) { // EPERM on macOS
-                std.debug.print("\nError: Raw ICMP socket requires root privileges.\n", .{});
-                std.debug.print("Please run with: sudo ./zig-out/bin/latency-heatmap ...\n\n", .{});
+        // Use RAW ICMP socket - requires sudo on macOS, Administrator on
+        // Windows (DGRAM ICMP can send but cannot receive replies on macOS)
+        // Raw calls (not Zig's error-set wrappers) to report errno properly
+        plat.netInit();
+        const sock = plat.openSocket(plat.AF_INET, plat.SOCK_RAW, plat.IPPROTO_ICMP);
+        if (!plat.isValidSocket(sock)) {
+            const err = plat.lastError();
+            if (plat.errPermission(err)) {
+                std.debug.print("\nError: Raw ICMP socket requires elevated privileges.\n", .{});
+                if (plat.is_windows) {
+                    std.debug.print("Please run from an Administrator prompt.\n\n", .{});
+                } else {
+                    std.debug.print("Please run with: sudo ./zig-out/bin/latency-heatmap ...\n\n", .{});
+                }
             } else {
-                std.debug.print("\nSocket creation failed with errno: {}\n", .{err});
+                std.debug.print("\nSocket creation failed with error: {}\n", .{err});
             }
             return error.SocketCreationFailed;
         }
-        const sock: posix.fd_t = @intCast(sock_fd);
+
+        // Windows: a raw socket receives nothing until it is bound to a
+        // specific local interface address
+        if (plat.is_windows) {
+            var baddr = posix.sockaddr.in{
+                .family = posix.AF.INET,
+                .port = 0,
+                .addr = rawSocketBindAddr(config.subnet, config.mask_bits),
+            };
+            _ = plat.bind(sock, &baddr, @sizeOf(posix.sockaddr.in));
+        }
 
         // Set socket to non-blocking for receives
-        // (O.NONBLOCK, not SOCK.NONBLOCK - the latter is a socket() creation
-        // flag and is a different bit on some platforms, e.g. macOS)
-        const flags = c.fcntl(sock, posix.F.GETFL, @as(c_int, 0));
-        if (flags < 0) return error.SocketCreationFailed;
-        const FlagsInt = std.meta.Int(.unsigned, @bitSizeOf(posix.O));
-        const o_nonblock: FlagsInt = @bitCast(posix.O{ .NONBLOCK = true });
-        if (c.fcntl(sock, posix.F.SETFL, flags | @as(c_int, o_nonblock)) < 0)
+        if (!plat.setNonblocking(sock))
             return error.SocketCreationFailed;
 
         // Ask the kernel to stamp arrival times on received packets so RTT
@@ -451,14 +534,14 @@ const Scanner = struct {
         var ts_enabled = false;
         if (kernel_ts.supported) {
             const one: c_int = 1;
-            ts_enabled = c.setsockopt(sock, kernel_ts.level, kernel_ts.sockopt, &one, @sizeOf(c_int)) == 0;
+            ts_enabled = plat.setsockopt(sock, kernel_ts.level, kernel_ts.sockopt, &one, @sizeOf(c_int)) == 0;
         }
 
         // Create event poller for efficient socket waiting
         const poller = try SocketPoller.init(sock);
 
         var magic: [4]u8 = undefined;
-        const pid: u32 = @bitCast(c.getpid());
+        const pid: u32 = plat.getpid();
         std.mem.writeInt(u32, &magic, pid ^ 0x5CA9B1E5, .little);
 
         return Scanner{
@@ -481,31 +564,40 @@ const Scanner = struct {
 
     // Receive one packet along with its kernel arrival timestamp (if enabled)
     fn recvPacket(self: *Scanner, buf: []u8) ?RecvPacket {
-        var src: posix.sockaddr.in = undefined;
-        var iov = [_]posix.iovec{.{ .base = buf.ptr, .len = buf.len }};
-        var control: [64]u8 align(8) = undefined;
-        var msg = std.mem.zeroes(c.msghdr);
-        msg.name = @ptrCast(&src);
-        msg.namelen = @sizeOf(posix.sockaddr.in);
-        msg.iov = &iov;
-        msg.iovlen = 1;
-        msg.control = &control;
-        msg.controllen = @intCast(control.len);
+        if (plat.is_windows) {
+            // No recvmsg/cmsg on Winsock; no kernel timestamps either
+            var src: posix.sockaddr.in = undefined;
+            var src_len: u32 = @sizeOf(posix.sockaddr.in);
+            const rc = plat.recvfrom(self.sock, buf, &src, &src_len);
+            if (rc < 0) return null;
+            return .{ .len = @intCast(rc), .src = src, .kernel_ts_us = null };
+        } else {
+            var src: posix.sockaddr.in = undefined;
+            var iov = [_]posix.iovec{.{ .base = buf.ptr, .len = buf.len }};
+            var control: [64]u8 align(8) = undefined;
+            var msg = std.mem.zeroes(c.msghdr);
+            msg.name = @ptrCast(&src);
+            msg.namelen = @sizeOf(posix.sockaddr.in);
+            msg.iov = &iov;
+            msg.iovlen = 1;
+            msg.control = &control;
+            msg.controllen = @intCast(control.len);
 
-        const rc = c.recvmsg(self.sock, &msg, c.MSG.DONTWAIT);
-        if (rc < 0) return null;
+            const rc = c.recvmsg(self.sock, &msg, c.MSG.DONTWAIT);
+            if (rc < 0) return null;
 
-        const controllen: usize = @intCast(msg.controllen);
-        const ts = if (self.kernel_ts_enabled)
-            kernel_ts.parse(control[0..@min(controllen, control.len)])
-        else
-            null;
-        return .{ .len = @intCast(rc), .src = src, .kernel_ts_us = ts };
+            const controllen: usize = @intCast(msg.controllen);
+            const ts = if (self.kernel_ts_enabled)
+                kernel_ts.parse(control[0..@min(controllen, control.len)])
+            else
+                null;
+            return .{ .len = @intCast(rc), .src = src, .kernel_ts_us = ts };
+        }
     }
 
     pub fn deinit(self: *Scanner) void {
         self.poller.deinit();
-        _ = c.close(self.sock);
+        plat.closeSocket(self.sock);
     }
 
     // Phase 1: Discovery - sender thread + receiver in main thread
@@ -756,12 +848,10 @@ const Scanner = struct {
                 const send_time = SendTime{ .mono = monotonicMicros(), .real = wallMicros() };
                 send_times[ping_idx] = send_time;
 
-                _ = c.sendto(
+                _ = plat.sendto(
                     self.sock,
                     &packet,
-                    packet.len,
-                    0,
-                    @ptrCast(&dest_addrs[host_idx]),
+                    &dest_addrs[host_idx],
                     @sizeOf(posix.sockaddr.in),
                 );
 
@@ -1158,6 +1248,9 @@ fn invalidArgValue(flag: []const u8, value: []const u8) noreturn {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
+    // Windows: initialize Winsock once, before any thread might race to
+    plat.netInit();
+
     // Get unbuffered stdout writer for immediate output (pass empty slice for unbuffered)
     var stdout_writer = std.Io.File.stdout().writer(init.io, &.{});
     const stdout = &stdout_writer.interface;
@@ -1219,7 +1312,8 @@ pub fn main(init: std.process.Init) !void {
                 \\           and TCP connect pings (handshakes are torn down with an
                 \\           RST, zero window, so nothing lingers on either side)
                 \\
-                \\Note: Requires root/sudo for raw ICMP sockets on most systems.
+                \\Note: Requires elevated privileges for raw ICMP sockets on most
+                \\systems (root/sudo; an Administrator prompt on Windows).
                 \\
             , .{ args[0], args[0], args[0], args[0] }) catch {};
             return;
@@ -1353,7 +1447,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (results.len == 0) {
         stdout.print("\n{s}No devices responded. Are you on the right subnet?{s}\n", .{ common.sgr("\x1b[93m"), reset }) catch {};
-        stdout.print("Try running with sudo if you haven't already.\n", .{}) catch {};
+        if (plat.is_windows) {
+            stdout.print("Try running from an Administrator prompt if you haven't already.\n", .{}) catch {};
+        } else {
+            stdout.print("Try running with sudo if you haven't already.\n", .{}) catch {};
+        }
         return;
     }
 
@@ -1371,6 +1469,7 @@ test {
     _ = @import("common.zig");
     _ = @import("mesh.zig");
     _ = @import("probe.zig");
+    _ = @import("plat.zig");
 }
 
 test "calculateChecksum verifies to zero over a packet containing its own checksum" {

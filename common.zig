@@ -4,6 +4,7 @@ const std = @import("std");
 const posix = std.posix;
 const c = std.c;
 const builtin = @import("builtin");
+const plat = @import("plat.zig");
 
 // Writer interface type for Zig 0.16
 pub const StdoutWriter = *std.Io.Writer;
@@ -18,7 +19,13 @@ pub var color_enabled: bool = false;
 extern "c" fn isatty(fd: c_int) c_int;
 
 pub fn initTerm(no_color_flag: bool) void {
-    stdout_is_tty = isatty(posix.STDOUT_FILENO) == 1;
+    if (plat.is_windows) {
+        // Also enables ANSI escape processing and UTF-8 output on the
+        // console, so the colors and block characters render
+        stdout_is_tty = plat.windowsSetupConsole();
+    } else {
+        stdout_is_tty = isatty(posix.STDOUT_FILENO) == 1;
+    }
     // Per https://no-color.org, NO_COLOR disables color when set to any
     // non-empty value
     const no_color_env = c.getenv("NO_COLOR");
@@ -48,19 +55,26 @@ pub const PingResult = struct {
 
 // Platform-agnostic event poller for socket readiness
 pub const SocketPoller = struct {
-    // Use kqueue on macOS/BSD, epoll on Linux
+    // Use kqueue on macOS/BSD, epoll on Linux, WSAPoll on Windows
     pub const is_darwin = builtin.os.tag == .macos or builtin.os.tag == .ios or
         builtin.os.tag == .watchos or builtin.os.tag == .tvos or
         builtin.os.tag == .freebsd or builtin.os.tag == .netbsd or
         builtin.os.tag == .openbsd or builtin.os.tag == .dragonfly;
 
     pub const is_linux = builtin.os.tag == .linux;
+    pub const is_windows = builtin.os.tag == .windows;
 
-    fd: posix.fd_t,
-    sock: posix.fd_t,
+    // The event fd only exists for kqueue/epoll; Windows polls the socket
+    // directly (posix.fd_t is not an integer type there)
+    const EventFd = if (is_windows) i32 else posix.fd_t;
 
-    pub fn init(sock: posix.fd_t) !SocketPoller {
-        if (is_darwin) {
+    fd: EventFd,
+    sock: plat.Socket,
+
+    pub fn init(sock: plat.Socket) !SocketPoller {
+        if (is_windows) {
+            return .{ .fd = -1, .sock = sock };
+        } else if (is_darwin) {
             const kq = c.kqueue();
             if (kq < 0) return error.PollerInitFailed;
             // Register socket for read events
@@ -93,6 +107,7 @@ pub const SocketPoller = struct {
     }
 
     pub fn deinit(self: *SocketPoller) void {
+        if (is_windows) return;
         if (self.fd >= 0) {
             _ = c.close(self.fd);
         }
@@ -101,7 +116,9 @@ pub const SocketPoller = struct {
     // Wait for socket to be readable, returns true if data available, false on timeout
     // timeout_ms: max time to wait in milliseconds
     pub fn wait(self: *SocketPoller, timeout_ms: u32) bool {
-        if (is_darwin) {
+        if (is_windows) {
+            return plat.pollOne(self.sock, plat.POLL_IN, @intCast(timeout_ms));
+        } else if (is_darwin) {
             const timeout = c.timespec{
                 .sec = @intCast(timeout_ms / 1000),
                 .nsec = @intCast((timeout_ms % 1000) * 1_000_000),
@@ -151,21 +168,33 @@ pub fn clockMicros(clk: c.clockid_t) i64 {
 }
 
 pub fn monotonicMicros() i64 {
-    return clockMicros(.MONOTONIC);
+    if (plat.is_windows) {
+        return plat.windowsMonotonicMicros();
+    } else {
+        return clockMicros(.MONOTONIC);
+    }
 }
 
 // Wall clock in µs since the Unix epoch, the same clock domain as the
 // kernel's SO_TIMESTAMP receive stamps.
 pub fn wallMicros() i64 {
-    return clockMicros(.REALTIME);
+    if (plat.is_windows) {
+        return plat.windowsWallMicros();
+    } else {
+        return clockMicros(.REALTIME);
+    }
 }
 
 pub fn sleepNanos(ns: u64) void {
-    var req: c.timespec = .{
-        .sec = @intCast(ns / std.time.ns_per_s),
-        .nsec = @intCast(ns % std.time.ns_per_s),
-    };
-    _ = c.nanosleep(&req, null);
+    if (plat.is_windows) {
+        plat.windowsSleepNanos(ns);
+    } else {
+        var req: c.timespec = .{
+            .sec = @intCast(ns / std.time.ns_per_s),
+            .nsec = @intCast(ns % std.time.ns_per_s),
+        };
+        _ = c.nanosleep(&req, null);
+    }
 }
 
 pub fn ipToString(ip: [4]u8, buf: []u8) []const u8 {

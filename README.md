@@ -6,9 +6,10 @@ A fast network scanner that discovers hosts on your network and measures their l
 
 ## Features
 
+- **Cross-platform**: Runs natively on Linux (epoll), macOS/BSD (kqueue), and Windows (Winsock2 + WSAPoll)
 - **Two-phase scanning**: Fast discovery phase followed by accurate latency measurement
-- **Kernel receive timestamps**: Uses `SO_TIMESTAMP` so replies are stamped by the kernel on arrival — process wakeup and scheduling delay don't inflate measured RTTs (falls back to userspace timestamps where unavailable)
-- **Monotonic timing**: All pacing, timeouts, and fallback measurements use `CLOCK_MONOTONIC`; kernel stamps (wall clock only) are cross-checked against a monotonic upper bound, so an NTP step or slew mid-scan can't corrupt samples or stall the scanner
+- **Kernel receive timestamps**: Uses `SO_TIMESTAMP` on Linux and macOS so replies are stamped by the kernel on arrival — process wakeup and scheduling delay don't inflate measured RTTs (falls back to userspace timestamps where unavailable, including on Windows)
+- **Monotonic timing**: All pacing, timeouts, and fallback measurements use `CLOCK_MONOTONIC` (`QueryPerformanceCounter` on Windows); kernel stamps (wall clock only) are cross-checked against a monotonic upper bound, so an NTP step or slew mid-scan can't corrupt samples or stall the scanner
 - **Visual heatmap**: Color-coded latency display to quickly identify slow devices
 - **Concurrent scanning**: Uses separate sender/receiver threads for maximum throughput
 - **Large subnet support**: Can scan /16 networks (65k+ hosts) efficiently
@@ -20,8 +21,8 @@ A fast network scanner that discovers hosts on your network and measures their l
 
 ## Requirements
 
-- macOS (kqueue) or Linux (epoll) — uses raw ICMP sockets
-- Root privileges (sudo) for raw socket access
+- macOS/BSD (kqueue), Linux (epoll), or Windows 10+ (Winsock2) — uses raw ICMP sockets
+- Elevated privileges for raw socket access: root/sudo on macOS and Linux, an Administrator prompt on Windows
 - Zig 0.16+
 
 ## Building
@@ -36,10 +37,22 @@ Run the unit tests with:
 zig build test
 ```
 
+Cross-compile for another platform with `-Dtarget`, e.g. a Windows binary from any host:
+
+```bash
+zig build -Dtarget=x86_64-windows    # or aarch64-windows, aarch64-macos, ...
+```
+
 ## Usage
 
 ```bash
 sudo ./zig-out/bin/latency-heatmap [subnet/mask] [options]
+```
+
+On Windows, run from an elevated (Administrator) terminal:
+
+```powershell
+.\zig-out\bin\latency-heatmap.exe [subnet/mask] [options]
 ```
 
 ### Examples
@@ -78,6 +91,14 @@ sudo ./zig-out/bin/latency-heatmap --mesh --tcp-ping 192.168.1.1:443 --tcp-ping 
 | `--no-color` | Disable colored output (also off when stdout is not a terminal or `NO_COLOR` is set) | |
 | `-h, --help` | Show help message | |
 
+### Windows notes
+
+- Raw ICMP sockets require an elevated (Administrator) terminal; without one the scanner exits with a clear error.
+- The raw socket is automatically bound to the interface on the scanned subnet (Winsock requires a specific local address to receive raw ICMP).
+- Windows Defender Firewall can silently drop inbound traffic: if discovery finds nothing on a network you know is populated, check the firewall profile for the active network.
+- ANSI colors and the Unicode heatmap blocks are enabled automatically (virtual terminal processing + UTF-8 code page); Windows Terminal and modern conhost both render them.
+- Auto-detected interfaces display as `if<index>` (Windows' address table carries no interface names).
+
 ## How It Works
 
 1. **Phase 1: Discovery**
@@ -87,7 +108,7 @@ sudo ./zig-out/bin/latency-heatmap --mesh --tcp-ping 192.168.1.1:443 --tcp-ping 
 
 2. **Phase 2: Latency Measurement**
    - For each discovered host, sends multiple pings
-   - Reply arrival times come from kernel timestamps (`SCM_TIMESTAMP`), not userspace clocks, so scheduling jitter is excluded from the samples
+   - On Linux and macOS, reply arrival times come from kernel timestamps (`SCM_TIMESTAMP`), not userspace clocks, so scheduling jitter is excluded from the samples; Windows has no equivalent, so samples there use monotonic userspace timestamps taken at poll wakeup
    - Records min/avg/max latency for each host
    - The early-exit silence window scales with the slowest RTT observed so far, so replies from high-latency hosts still in flight aren't clipped by a burst of fast responders finishing first
    - Displays results with color-coded heatmap

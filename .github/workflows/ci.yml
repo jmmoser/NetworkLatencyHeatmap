@@ -10,9 +10,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both platforms matter: the poller (epoll vs kqueue) and the
-        # SO_TIMESTAMP cmsg layout differ between Linux and macOS
-        os: [ubuntu-latest, macos-latest]
+        # All three platforms matter: the poller (epoll vs kqueue vs
+        # WSAPoll), the socket layer (libc vs Winsock), and the
+        # SO_TIMESTAMP cmsg layout all differ between them
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
