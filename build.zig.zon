@@ -9,5 +9,6 @@
         "main.zig",
         "common.zig",
         "mesh.zig",
+        "probe.zig",
     },
 }
