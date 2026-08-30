@@ -42,10 +42,54 @@ const IFF_UP: c_uint = 0x1;
 const IFF_LOOPBACK: c_uint = 0x8;
 const IFF_RUNNING: c_uint = 0x40;
 
-fn detectLocalSubnet() ?struct { subnet: [4]u8, mask: u8 } {
+// Local address the default route would use, found by connect()ing a UDP
+// socket to a public address (no packet is sent — connect on UDP only
+// selects the route) and reading back the chosen source address. Null when
+// there is no default route. Works unprivileged on Linux and macOS alike,
+// unlike parsing /proc/net/route or the PF_ROUTE sysctls.
+fn defaultRouteLocalAddr() ?u32 {
+    const fd = c.socket(posix.AF.INET, c.SOCK.DGRAM, 0);
+    if (fd < 0) return null;
+    const sock: posix.fd_t = @intCast(fd);
+    defer _ = c.close(sock);
+
+    const probe_ip = [4]u8{ 8, 8, 8, 8 };
+    const dest = posix.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 53),
+        .addr = std.mem.bytesToValue(u32, &probe_ip),
+    };
+    if (c.connect(sock, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) != 0) return null;
+
+    var local: posix.sockaddr.in = undefined;
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    if (c.getsockname(sock, @ptrCast(&local), &len) != 0) return null;
+    return local.addr;
+}
+
+const DetectedSubnet = struct {
+    subnet: [4]u8,
+    mask: u8,
+    ifname: [16]u8, // IFNAMSIZ; zero-padded
+    ifname_len: u8,
+    on_default_route: bool,
+
+    fn name(self: *const DetectedSubnet) []const u8 {
+        return self.ifname[0..self.ifname_len];
+    }
+};
+
+// Pick the subnet to scan. Machines often have several eligible interfaces
+// (VPN tunnels, VM bridges, container networks), so prefer the one carrying
+// the default route; fall back to the first eligible interface when no
+// default route exists or its interface fails the eligibility checks.
+fn detectLocalSubnet() ?DetectedSubnet {
     var ifa_list: ?*ifaddrs = null;
     if (getifaddrs(&ifa_list) != 0) return null;
     defer if (ifa_list) |list| freeifaddrs(list);
+
+    const preferred_addr = defaultRouteLocalAddr();
+    var fallback: ?DetectedSubnet = null;
 
     var ifa = ifa_list;
     while (ifa) |iface| : (ifa = iface.next) {
@@ -89,9 +133,23 @@ fn detectLocalSubnet() ?struct { subnet: [4]u8, mask: u8 } {
             ip_bytes[3] & mask_bytes[3],
         };
 
-        return .{ .subnet = subnet, .mask = mask_bits };
+        const is_preferred = preferred_addr != null and addr_in.addr == preferred_addr.?;
+        var detected = DetectedSubnet{
+            .subnet = subnet,
+            .mask = mask_bits,
+            .ifname = @splat(0),
+            .ifname_len = 0,
+            .on_default_route = is_preferred,
+        };
+        const name_slice = std.mem.span(iface.name);
+        const take = @min(name_slice.len, detected.ifname.len);
+        @memcpy(detected.ifname[0..take], name_slice[0..take]);
+        detected.ifname_len = @intCast(take);
+
+        if (is_preferred) return detected;
+        if (fallback == null) fallback = detected;
     }
-    return null;
+    return fallback;
 }
 
 // Kernel receive timestamps: with SO_TIMESTAMP enabled, the kernel records
@@ -333,6 +391,22 @@ const Scanner = struct {
     kernel_ts_enabled: bool,
     generation: u8 = 0,
 
+    // Optional callback invoked periodically from inside the scan loops, so
+    // mesh mode can keep beaconing and draining its UDP socket during a
+    // scan that outlasts the peer timeout. Throttled to tick_interval_us.
+    tick_fn: ?*const fn (ctx: *anyopaque) void = null,
+    tick_ctx: ?*anyopaque = null,
+    last_tick_us: i64 = 0,
+
+    const tick_interval_us: i64 = 200_000;
+
+    fn tick(self: *Scanner, now: i64) void {
+        const f = self.tick_fn orelse return;
+        if (now - self.last_tick_us < tick_interval_us) return;
+        self.last_tick_us = now;
+        f(self.tick_ctx.?);
+    }
+
     // Payload tag written into every echo request and checked on every reply,
     // so replies to other processes' pings (a raw ICMP socket sees them all)
     // and stale replies from a previous phase are ignored. The phase byte
@@ -503,13 +577,14 @@ const Scanner = struct {
 
             // Now check exit conditions and update progress
             const now = monotonicMicros();
+            self.tick(now);
             const sender_done = state.sender_done.load(.seq_cst);
 
             // Record when sender finishes
             if (sender_done and sender_finish_time == null) {
                 sender_finish_time = now;
                 // Print final send count
-                stdout.print("\r  Sent: {d}/{d} - waiting for replies...                    \n", .{ state.sent_count.load(.seq_cst), self.all_ips.len }) catch {};
+                stdout.print("{s}  Sent: {d}/{d} - waiting for replies...                    \n", .{ common.cr(), state.sent_count.load(.seq_cst), self.all_ips.len }) catch {};
             }
 
             // Check exit conditions after sender finished
@@ -521,7 +596,7 @@ const Scanner = struct {
 
                 // Exit early if no hosts discovered after 500ms
                 if (discovered_count == 0 and time_since_finish_ms > 500) {
-                    stdout.print("\r  No hosts found, exiting early.                              \n", .{}) catch {};
+                    stdout.print("{s}  No hosts found, exiting early.                              \n", .{common.cr()}) catch {};
                     break;
                 }
 
@@ -531,8 +606,8 @@ const Scanner = struct {
                 }
             }
 
-            // Update progress periodically
-            if (now - last_print > 100_000) {
+            // Update progress periodically (\r-rewriting lines, TTY only)
+            if (common.stdout_is_tty and now - last_print > 100_000) {
                 last_print = now;
                 const sent = state.sent_count.load(.seq_cst);
                 const discovered_count = discovered.count();
@@ -553,7 +628,7 @@ const Scanner = struct {
         // Wait for sender to finish
         sender.join();
 
-        stdout.print("\r  Discovered: {d} hosts                                      \n", .{discovered.count()}) catch {};
+        stdout.print("{s}  Discovered: {d} hosts                                      \n", .{ common.cr(), discovered.count() }) catch {};
 
         // Convert to array
         var alive_hosts: std.ArrayList([4]u8) = .empty;
@@ -617,7 +692,7 @@ const Scanner = struct {
         // Timing control
         const inter_ping_delay_us: i64 = 1000; // 1ms between pings to avoid flooding
         const round_delay_us: i64 = 20_000; // 20ms between rounds
-        const adaptive_timeout_us: i64 = 100_000; // 100ms of silence = done
+        const adaptive_timeout_us: i64 = 100_000; // minimum silence before exiting early
         const max_timeout_us: i64 = @as(i64, self.config.latency_timeout_ms) * 1000;
 
         var responses_received: usize = 0;
@@ -626,6 +701,7 @@ const Scanner = struct {
         var last_send_time: i64 = 0;
         var last_response_time: i64 = 0;
         var last_progress_print: i64 = 0;
+        var max_rtt_seen: i64 = 0;
         var all_sent = false;
 
         var recv_buf: [1024]u8 align(4) = undefined;
@@ -642,11 +718,17 @@ const Scanner = struct {
         // Event loop: interleave sending and receiving
         while (true) {
             const now = monotonicMicros();
+            self.tick(now);
 
             // Check exit conditions
             if (all_sent) {
-                // Adaptive exit: no responses for a while
-                if (last_response_time > 0 and (now - last_response_time) > adaptive_timeout_us) break;
+                // Adaptive exit: no responses for a while. The silence
+                // window scales with the slowest RTT observed so far —
+                // a fixed 100ms would clip replies still in flight from
+                // hosts slower than that (exactly the hosts worth seeing)
+                // whenever a burst of fast hosts finishes answering first.
+                const silence_needed = @max(adaptive_timeout_us, 2 * max_rtt_seen);
+                if (last_response_time > 0 and (now - last_response_time) > silence_needed) break;
                 // Hard timeout, measured from the last send so the final
                 // round still gets its full reply window (-t is the timeout
                 // per ping, and sending alone can take longer than -t)
@@ -756,12 +838,14 @@ const Scanner = struct {
                     received[ping_idx] = true;
                     responses_received += 1;
                     last_response_time = recv_mono;
+                    max_rtt_seen = @max(max_rtt_seen, mono_rtt);
                 }
 
                 // Throttle progress output: stdout is unbuffered, so each
                 // update is a blocking write syscall that would otherwise
-                // sit in the receive path and delay fallback timestamps
-                if (now - last_progress_print > 100_000) {
+                // sit in the receive path and delay fallback timestamps.
+                // In-place updates only make sense on a TTY.
+                if (common.stdout_is_tty and now - last_progress_print > 100_000) {
                     last_progress_print = now;
                     printProgress(stdout, responses_received, total_pings);
                 }
@@ -807,7 +891,7 @@ fn generateIpRange(allocator: std.mem.Allocator, subnet: [4]u8, mask_bits: u8) !
 }
 
 fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: usize) void {
-    const reset = "\x1b[0m";
+    const reset = common.sgr("\x1b[0m");
     const col_width = 28; // Fixed column width for alignment
     const spaces = " " ** col_width;
 
@@ -886,9 +970,11 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
         }
     }
 
-    stdout.print("\n\x1b[1m══════════════════════════════════════════════════════════════\x1b[0m\n", .{}) catch {};
-    stdout.print("\x1b[1m                     NETWORK SUMMARY\x1b[0m\n", .{}) catch {};
-    stdout.print("\x1b[1m══════════════════════════════════════════════════════════════\x1b[0m\n\n", .{}) catch {};
+    const bold = common.sgr("\x1b[1m");
+    const reset = common.sgr("\x1b[0m");
+    stdout.print("\n{s}══════════════════════════════════════════════════════════════{s}\n", .{ bold, reset }) catch {};
+    stdout.print("{s}                     NETWORK SUMMARY{s}\n", .{ bold, reset }) catch {};
+    stdout.print("{s}══════════════════════════════════════════════════════════════{s}\n\n", .{ bold, reset }) catch {};
 
     stdout.print("  Hosts scanned:  {d}\n", .{results.len}) catch {};
     stdout.print("  Hosts alive:    {d} ({d:.1}%)\n", .{
@@ -908,7 +994,7 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
     }
 
     if (slow_count > 0) {
-        stdout.print("\n  \x1b[93m⚠ Slow devices (avg >20ms):\x1b[0m\n", .{}) catch {};
+        stdout.print("\n  {s}⚠ Slow devices (avg >20ms):{s}\n", .{ common.sgr("\x1b[93m"), reset }) catch {};
         for (slow_devices[0..slow_count]) |r| {
             var ip_buf: [16]u8 = undefined;
             var lat_buf: [16]u8 = undefined;
@@ -919,17 +1005,18 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
         }
     }
 
-    stdout.print("\n\x1b[1m══════════════════════════════════════════════════════════════\x1b[0m\n", .{}) catch {};
+    stdout.print("\n{s}══════════════════════════════════════════════════════════════{s}\n", .{ bold, reset }) catch {};
 }
 
 fn printLegend(stdout: StdoutWriter) void {
-    stdout.print("\n\x1b[1mLegend:\x1b[0m ", .{}) catch {};
-    stdout.print("\x1b[92m█ <1ms\x1b[0m  ", .{}) catch {};
-    stdout.print("\x1b[32m▓ <5ms\x1b[0m  ", .{}) catch {};
-    stdout.print("\x1b[93m▒ <20ms\x1b[0m  ", .{}) catch {};
-    stdout.print("\x1b[33m░ <100ms\x1b[0m  ", .{}) catch {};
-    stdout.print("\x1b[91m▪ >100ms\x1b[0m  ", .{}) catch {};
-    stdout.print("\x1b[90m· offline\x1b[0m\n", .{}) catch {};
+    const reset = common.sgr("\x1b[0m");
+    stdout.print("\n{s}Legend:{s} ", .{ common.sgr("\x1b[1m"), reset }) catch {};
+    stdout.print("{s}█ <1ms{s}  ", .{ common.sgr("\x1b[92m"), reset }) catch {};
+    stdout.print("{s}▓ <5ms{s}  ", .{ common.sgr("\x1b[32m"), reset }) catch {};
+    stdout.print("{s}▒ <20ms{s}  ", .{ common.sgr("\x1b[93m"), reset }) catch {};
+    stdout.print("{s}░ <100ms{s}  ", .{ common.sgr("\x1b[33m"), reset }) catch {};
+    stdout.print("{s}▪ >100ms{s}  ", .{ common.sgr("\x1b[91m"), reset }) catch {};
+    stdout.print("{s}· offline{s}\n", .{ common.sgr("\x1b[90m"), reset }) catch {};
 }
 
 fn printProgress(stdout: StdoutWriter, done: usize, total: usize) void {
@@ -944,7 +1031,8 @@ fn printProgress(stdout: StdoutWriter, done: usize, total: usize) void {
     const full_blocks = "█" ** bar_width;
     const empty_blocks = "░" ** bar_width;
     var buf: [256]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "\r  Measuring: [{s}{s}] {d:.1}% ({d}/{d})", .{
+    const line = std.fmt.bufPrint(&buf, "{s}  Measuring: [{s}{s}] {d:.1}% ({d}/{d})", .{
+        common.cr(),
         full_blocks[0 .. filled * 3],
         empty_blocks[0 .. (bar_width - filled) * 3],
         percent,
@@ -1017,6 +1105,21 @@ fn runMeshMode(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
     defer mesh.deinit();
     try mesh.startProber();
 
+    // Keep the mesh alive (beacons + socket drain, no gossip) while scans
+    // run, so a scan longer than the peer timeout doesn't get this node
+    // dropped from every peer's table
+    scanner.tick_ctx = @ptrCast(&mesh);
+    scanner.tick_fn = &struct {
+        fn call(ctx: *anyopaque) void {
+            const m: *mesh_mod.Mesh = @ptrCast(@alignCast(ctx));
+            m.keepAlive();
+        }
+    }.call;
+    defer {
+        scanner.tick_fn = null;
+        scanner.tick_ctx = null;
+    }
+
     const rescan_us: i64 = @as(i64, config.rescan_interval_s) * std.time.us_per_s;
     var next_scan_at: i64 = monotonicMicros(); // first scan runs immediately
 
@@ -1062,12 +1165,14 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     // Detect local subnet, fall back to 192.168.1.0/24
-    var config = if (detectLocalSubnet()) |detected|
+    const detected_subnet = detectLocalSubnet();
+    var config = if (detected_subnet) |detected|
         Config{ .subnet = detected.subnet, .mask_bits = detected.mask }
     else
         Config{};
 
     // Parse command line args
+    var no_color = false;
     var subnet_set = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -1099,6 +1204,8 @@ pub fn main(init: std.process.Init) !void {
                 \\              port (SYN→SYN-ACK, or RST from a closed port — both time
                 \\              the host's stack). Works on devices not running this
                 \\              tool; repeatable, up to 16 targets
+                \\  --no-color  Disable colored output (also disabled when stdout is
+                \\              not a terminal, or the NO_COLOR env var is set)
                 \\  -h, --help  Show this help
                 \\
                 \\The subnet is auto-detected from your network interface if not specified.
@@ -1133,6 +1240,8 @@ pub fn main(init: std.process.Init) !void {
             const value = nextArgValue(args, &i);
             config.latency_timeout_ms = std.fmt.parseInt(u32, value, 10) catch
                 return invalidArgValue("-t", value);
+        } else if (std.mem.eql(u8, arg, "--no-color")) {
+            no_color = true;
         } else if (std.mem.eql(u8, arg, "--mesh")) {
             config.mesh = true;
         } else if (std.mem.eql(u8, arg, "--mesh-port")) {
@@ -1173,11 +1282,16 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
+    common.initTerm(no_color);
+
     // Print banner
+    const cyan = common.sgr("\x1b[96m");
+    const bold = common.sgr("\x1b[1m");
+    const reset = common.sgr("\x1b[0m");
     stdout.print("\n", .{}) catch {};
-    stdout.print("\x1b[96m╔══════════════════════════════════════════════════════════════╗\x1b[0m\n", .{}) catch {};
-    stdout.print("\x1b[96m║\x1b[0m             \x1b[1mNetwork Latency Heatmap Scanner\x1b[0m                  \x1b[96m║\x1b[0m\n", .{}) catch {};
-    stdout.print("\x1b[96m╚══════════════════════════════════════════════════════════════╝\x1b[0m\n", .{}) catch {};
+    stdout.print("{s}╔══════════════════════════════════════════════════════════════╗{s}\n", .{ cyan, reset }) catch {};
+    stdout.print("{s}║{s}             {s}Network Latency Heatmap Scanner{s}                  {s}║{s}\n", .{ cyan, reset, bold, reset, cyan, reset }) catch {};
+    stdout.print("{s}╚══════════════════════════════════════════════════════════════╝{s}\n", .{ cyan, reset }) catch {};
 
     var subnet_buf: [32]u8 = undefined;
     const subnet_str = std.fmt.bufPrint(&subnet_buf, "{}.{}.{}.{}/{}", .{
@@ -1188,7 +1302,18 @@ pub fn main(init: std.process.Init) !void {
         config.mask_bits,
     }) catch "???";
 
-    stdout.print("\n  Subnet: {s}\n", .{subnet_str}) catch {};
+    stdout.print("\n  Subnet: {s}", .{subnet_str}) catch {};
+    if (!subnet_set) {
+        if (detected_subnet) |detected| {
+            stdout.print(" (auto-detected on {s}{s})", .{
+                detected.name(),
+                if (detected.on_default_route) ", default route" else "",
+            }) catch {};
+        } else {
+            stdout.print(" (default; no local subnet detected)", .{}) catch {};
+        }
+    }
+    stdout.print("\n", .{}) catch {};
     stdout.print("  Discovery timeout: {d}ms | Latency pings: {d} | Ping timeout: {d}ms\n", .{
         config.discovery_timeout_ms,
         config.latency_pings,
@@ -1227,14 +1352,14 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(results);
 
     if (results.len == 0) {
-        stdout.print("\n\x1b[93mNo devices responded. Are you on the right subnet?\x1b[0m\n", .{}) catch {};
+        stdout.print("\n{s}No devices responded. Are you on the right subnet?{s}\n", .{ common.sgr("\x1b[93m"), reset }) catch {};
         stdout.print("Try running with sudo if you haven't already.\n", .{}) catch {};
         return;
     }
 
     printLegend(stdout);
 
-    stdout.print("\n\x1b[1mActive Devices:\x1b[0m\n", .{}) catch {};
+    stdout.print("\n{s}Active Devices:{s}\n", .{ bold, reset }) catch {};
     printHeatmapGrid(stdout, results, 4);
 
     printSummary(stdout, results);

@@ -961,6 +961,41 @@ pub const Mesh = struct {
         }
     }
 
+    fn drainSocket(self: *Mesh, now: i64) void {
+        var buf: [recv_buf_len]u8 = undefined;
+        while (true) {
+            var src: posix.sockaddr.in = undefined;
+            var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+            const rc = c.recvfrom(self.sock, &buf, buf.len, 0, @ptrCast(&src), &src_len);
+            if (rc <= 0) break;
+            if (src.family != posix.AF.INET) continue;
+            const parsed = parseMessage(buf[0..@intCast(rc)]) orelse continue;
+            self.handleMessage(parsed, &src, now);
+        }
+    }
+
+    // Beacon and drain only — no result gossip. Called from inside the
+    // scanner's loops so that a long scan (a /16 discovery, or many hosts
+    // with a generous timeout) doesn't go silent past peer_timeout_us and
+    // get this node dropped from every peer's table, and so the UDP receive
+    // buffer doesn't overflow while the scan runs. Gossip stays deferred
+    // until the scan finishes, keeping mesh traffic out of the measurement
+    // window.
+    pub fn keepAlive(self: *Mesh) void {
+        const now = monotonicMicros();
+        if (now - self.last_beacon_us >= beacon_interval_us) {
+            self.last_beacon_us = now;
+            self.sendBeacons();
+            self.expirePeers(now);
+        }
+        // Keep the TCP accept queue drained too, or a scan longer than a few
+        // probe rounds fills the backlog and peers' SYNs start timing out.
+        // Peer pings stay out of keepAlive on purpose: an RTT sampled while
+        // the scanner is blasting would be inflated by our own load.
+        self.drainTcpAccepts();
+        self.drainSocket(now);
+    }
+
     // One iteration of mesh housekeeping: announce, gossip, drain the
     // socket. Call from the main loop; never blocks.
     pub fn pump(self: *Mesh) void {
@@ -978,18 +1013,7 @@ pub const Mesh = struct {
             self.gossipResults();
         }
 
-        // Drain incoming TCP probe connections: accept and abort each with
-        // an RST (zero window) so probers get their timing without either
-        // side accumulating open connections or TIME_WAIT state
-        if (self.tcp_listen >= 0) {
-            while (true) {
-                const cfd = c.accept(self.tcp_listen, null, null);
-                if (cfd < 0) break;
-                const lo = c.linger{ .onoff = 1, .linger = 0 };
-                _ = c.setsockopt(@intCast(cfd), posix.SOL.SOCKET, posix.SO.LINGER, &lo, @sizeOf(c.linger));
-                _ = c.close(@intCast(cfd));
-            }
-        }
+        self.drainTcpAccepts();
 
         // Refresh the prober's peer snapshot and pick up finished rounds
         {
@@ -1007,15 +1031,20 @@ pub const Mesh = struct {
             }
         }
 
-        var buf: [recv_buf_len]u8 = undefined;
+        self.drainSocket(now);
+    }
+
+    // Drain incoming TCP probe connections: accept and abort each with an
+    // RST (zero window) so probers get their timing without either side
+    // accumulating open connections or TIME_WAIT state
+    fn drainTcpAccepts(self: *Mesh) void {
+        if (self.tcp_listen < 0) return;
         while (true) {
-            var src: posix.sockaddr.in = undefined;
-            var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-            const rc = c.recvfrom(self.sock, &buf, buf.len, 0, @ptrCast(&src), &src_len);
-            if (rc <= 0) break;
-            if (src.family != posix.AF.INET) continue;
-            const parsed = parseMessage(buf[0..@intCast(rc)]) orelse continue;
-            self.handleMessage(parsed, &src, now);
+            const cfd = c.accept(self.tcp_listen, null, null);
+            if (cfd < 0) break;
+            const lo = c.linger{ .onoff = 1, .linger = 0 };
+            _ = c.setsockopt(@intCast(cfd), posix.SOL.SOCKET, posix.SO.LINGER, &lo, @sizeOf(c.linger));
+            _ = c.close(@intCast(cfd));
         }
     }
 
@@ -1056,9 +1085,11 @@ pub const Mesh = struct {
     }
 
     fn render(self: *Mesh, stdout: StdoutWriter, now: i64, next_scan_at: ?i64) void {
-        const reset = "\x1b[0m";
-        const bold = "\x1b[1m";
-        const gray = "\x1b[90m";
+        const reset = common.sgr("\x1b[0m");
+        const bold = common.sgr("\x1b[1m");
+        const gray = common.sgr("\x1b[90m");
+        const cyan = common.sgr("\x1b[96m");
+        const yellow = common.sgr("\x1b[93m");
         const col_width = 13;
         const label_width = 17;
         const pad = " " ** 32;
@@ -1092,11 +1123,13 @@ pub const Mesh = struct {
         while (kit.next()) |k| rows.append(self.allocator, k.*) catch {};
         std.mem.sort(u32, rows.items, {}, std.sort.asc(u32));
 
-        // Redraw from the top; the matrix is a live view, not a log
-        stdout.print("\x1b[2J\x1b[H", .{}) catch {};
-        stdout.print("{s}╔══════════════════════════════════════════════════════════════╗{s}\n", .{ "\x1b[96m", reset }) catch {};
-        stdout.print("\x1b[96m║\x1b[0m               {s}Network Latency Mesh View{s}                      \x1b[96m║{s}\n", .{ bold, reset, reset }) catch {};
-        stdout.print("{s}╚══════════════════════════════════════════════════════════════╝{s}\n\n", .{ "\x1b[96m", reset }) catch {};
+        // Redraw from the top; the matrix is a live view, not a log. When
+        // output is piped there is no screen to clear — each render is
+        // appended as a plain snapshot instead.
+        if (common.stdout_is_tty) stdout.print("\x1b[2J\x1b[H", .{}) catch {};
+        stdout.print("{s}╔══════════════════════════════════════════════════════════════╗{s}\n", .{ cyan, reset }) catch {};
+        stdout.print("{s}║{s}               {s}Network Latency Mesh View{s}                      {s}║{s}\n", .{ cyan, reset, bold, reset, cyan, reset }) catch {};
+        stdout.print("{s}╚══════════════════════════════════════════════════════════════╝{s}\n\n", .{ cyan, reset }) catch {};
 
         stdout.print("  Node {s}{s}{s} (id {x:0>8}) · UDP port {d} · {d} peer{s} · {d} target{s}\n", .{
             bold,
@@ -1166,7 +1199,7 @@ pub const Mesh = struct {
             }
             if (row_samples >= 2 and spreadIsUneven(row_min, row_max)) {
                 uneven_count += 1;
-                stdout.print("\x1b[93m◀ uneven\x1b[0m", .{}) catch {};
+                stdout.print("{s}◀ uneven{s}", .{ yellow, reset }) catch {};
             }
             stdout.print("\n", .{}) catch {};
         }
@@ -1174,7 +1207,7 @@ pub const Mesh = struct {
             stdout.print("  {s}... +{d} more targets{s}\n", .{ gray, rows.items.len - shown_rows, reset }) catch {};
         }
 
-        stdout.print("\n  {s}avg latency as seen from each observer · {s}◀ uneven{s}{s} = slowest vantage ≥3x fastest{s}\n", .{ gray, "\x1b[93m", reset, gray, reset }) catch {};
+        stdout.print("\n  {s}avg latency as seen from each observer · {s}◀ uneven{s}{s} = slowest vantage ≥3x fastest{s}\n", .{ gray, yellow, reset, gray, reset }) catch {};
 
         self.renderLinks(stdout, observers[0..num_obs], shown_obs);
         self.renderInsights(stdout, observers[0..num_obs], rows.items, uneven_count);
@@ -1217,9 +1250,9 @@ pub const Mesh = struct {
     // column from that peer's gossiped links message, so all nodes converge
     // on the same picture from any seat.
     fn renderLinks(self: *Mesh, stdout: StdoutWriter, observers: []const Observer, shown_obs: usize) void {
-        const reset = "\x1b[0m";
-        const bold = "\x1b[1m";
-        const gray = "\x1b[90m";
+        const reset = common.sgr("\x1b[0m");
+        const bold = common.sgr("\x1b[1m");
+        const gray = common.sgr("\x1b[90m");
         const col_width = 13;
         const label_width = 17;
         const pad = " " ** 32;
@@ -1338,8 +1371,8 @@ pub const Mesh = struct {
     }
 
     fn printLinkCell(stdout: StdoutWriter, link: Link, col_width: usize) void {
-        const reset = "\x1b[0m";
-        const gray = "\x1b[90m";
+        const reset = common.sgr("\x1b[0m");
+        const gray = common.sgr("\x1b[90m");
         const pad = " " ** 32;
         if (link.udp == null and link.tcp == null) {
             stdout.print("{s}---{s}{s}", .{ gray, reset, pad[0 .. col_width - 3] }) catch {};
@@ -1358,8 +1391,8 @@ pub const Mesh = struct {
     }
 
     fn printTcpCell(stdout: StdoutWriter, avg_us: ?u64, refused: bool, col_width: usize) void {
-        const reset = "\x1b[0m";
-        const gray = "\x1b[90m";
+        const reset = common.sgr("\x1b[0m");
+        const gray = common.sgr("\x1b[90m");
         const pad = " " ** 32;
         var buf: [16]u8 = undefined;
         const s = formatLatency(avg_us, &buf);
@@ -1373,6 +1406,8 @@ pub const Mesh = struct {
     // Column-level analysis: an observer whose median latency to everything
     // is far above the mesh-wide median is itself poorly connected
     fn renderInsights(self: *Mesh, stdout: StdoutWriter, observers: []const Observer, rows: []const u32, uneven_count: usize) void {
+        const reset = common.sgr("\x1b[0m");
+        const yellow = common.sgr("\x1b[93m");
         var all_avgs: std.ArrayList(u64) = .empty;
         defer all_avgs.deinit(self.allocator);
         var col_medians: [1 + max_peers]?u64 = @splat(null);
@@ -1398,7 +1433,7 @@ pub const Mesh = struct {
             const col_median = col_medians[oi] orelse continue;
             if (col_median >= global_median * 3 and col_median - global_median > 2000) {
                 if (!printed_header) {
-                    stdout.print("\n  \x1b[93m⚠ Insights:\x1b[0m\n", .{}) catch {};
+                    stdout.print("\n  {s}⚠ Insights:{s}\n", .{ yellow, reset }) catch {};
                     printed_header = true;
                 }
                 var m_buf: [16]u8 = undefined;
@@ -1412,7 +1447,7 @@ pub const Mesh = struct {
         }
         if (uneven_count > 0) {
             if (!printed_header) {
-                stdout.print("\n  \x1b[93m⚠ Insights:\x1b[0m\n", .{}) catch {};
+                stdout.print("\n  {s}⚠ Insights:{s}\n", .{ yellow, reset }) catch {};
                 printed_header = true;
             }
             stdout.print("    {d} target{s} with uneven latency across observers — likely a slow link or AP between network segments\n", .{
