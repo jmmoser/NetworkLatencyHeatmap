@@ -50,9 +50,9 @@
 // drop ping/pong as unknown types, so mixing versions stays harmless.
 const std = @import("std");
 const posix = std.posix;
-const c = std.c;
 const common = @import("common.zig");
 const probe = @import("probe.zig");
+const plat = @import("plat.zig");
 
 const ipToU32 = common.ipToU32;
 const u32ToIp = common.u32ToIp;
@@ -350,8 +350,6 @@ fn medianOfSorted(sorted: []const u64) ?u64 {
     return sorted[sorted.len / 2];
 }
 
-extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
-
 fn splitmix64(seed: u64) u64 {
     var z = seed +% 0x9E3779B97F4A7C15;
     z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
@@ -451,13 +449,14 @@ const ProbeShared = struct {
 
 pub const Mesh = struct {
     allocator: std.mem.Allocator,
-    sock: posix.fd_t,
+    sock: plat.Socket,
     poller: common.SocketPoller,
     port: u16,
 
     // TCP listener on the mesh port so peers can time SYN → SYN-ACK against
-    // us; -1 when it couldn't be opened (peers then measure our RST instead)
-    tcp_listen: posix.fd_t,
+    // us; invalid when it couldn't be opened (peers then measure our RST
+    // instead)
+    tcp_listen: plat.Socket,
     probes: ProbeShared,
     prober: ?std.Thread,
     node_id: u64,
@@ -484,24 +483,25 @@ pub const Mesh = struct {
     dirty: bool,
 
     pub fn init(allocator: std.mem.Allocator, port: u16, subnet: [4]u8, mask_bits: u8, tcp_targets: []const probe.TcpTarget) !Mesh {
-        const sock_fd = c.socket(posix.AF.INET, c.SOCK.DGRAM, 0);
-        if (sock_fd < 0) return error.MeshSocketFailed;
-        const sock: posix.fd_t = @intCast(sock_fd);
-        errdefer _ = c.close(sock);
+        plat.netInit();
+        const sock = plat.openSocket(plat.AF_INET, plat.SOCK_DGRAM, 0);
+        if (!plat.isValidSocket(sock)) return error.MeshSocketFailed;
+        errdefer plat.closeSocket(sock);
 
         const one: c_int = 1;
-        if (c.setsockopt(sock, posix.SOL.SOCKET, posix.SO.BROADCAST, &one, @sizeOf(c_int)) != 0)
+        if (plat.setsockopt(sock, posix.SOL.SOCKET, posix.SO.BROADCAST, &one, @sizeOf(c_int)) != 0)
             return error.MeshSocketFailed;
-        // REUSEADDR+REUSEPORT so several instances on one machine can share
-        // the port (each still receives every broadcast), handy for testing
-        _ = c.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &one, @sizeOf(c_int));
-        _ = c.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEPORT, &one, @sizeOf(c_int));
+        // REUSEADDR (+REUSEPORT where it exists) so several instances on one
+        // machine can share the port (each still receives every broadcast),
+        // handy for testing
+        _ = plat.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &one, @sizeOf(c_int));
+        if (!plat.is_windows)
+            _ = plat.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEPORT, &one, @sizeOf(c_int));
+        // Windows: don't let ICMP unreachable from a gone peer surface as
+        // recv errors on the shared broadcast socket
+        plat.disableUdpConnReset(sock);
 
-        const flags = c.fcntl(sock, posix.F.GETFL, @as(c_int, 0));
-        if (flags < 0) return error.MeshSocketFailed;
-        const FlagsInt = std.meta.Int(.unsigned, @bitSizeOf(posix.O));
-        const o_nonblock: FlagsInt = @bitCast(posix.O{ .NONBLOCK = true });
-        if (c.fcntl(sock, posix.F.SETFL, flags | @as(c_int, o_nonblock)) < 0)
+        if (!plat.setNonblocking(sock))
             return error.MeshSocketFailed;
 
         var bind_addr = posix.sockaddr.in{
@@ -509,27 +509,25 @@ pub const Mesh = struct {
             .port = std.mem.nativeToBig(u16, port),
             .addr = 0, // INADDR_ANY
         };
-        if (c.bind(sock, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in)) != 0)
+        if (plat.bind(sock, &bind_addr, @sizeOf(posix.sockaddr.in)) != 0)
             return error.MeshBindFailed;
 
         const poller = try common.SocketPoller.init(sock);
 
         // TCP listener for incoming SYN probes. Best-effort: without it the
         // kernel answers peers' SYNs with an RST, which they can still time.
-        var tcp_listen: posix.fd_t = -1;
+        var tcp_listen: plat.Socket = plat.invalid_socket;
         tcp: {
-            const tfd_c = c.socket(posix.AF.INET, c.SOCK.STREAM, 0);
-            if (tfd_c < 0) break :tcp;
-            const tfd: posix.fd_t = @intCast(tfd_c);
-            _ = c.setsockopt(tfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &one, @sizeOf(c_int));
-            _ = c.setsockopt(tfd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &one, @sizeOf(c_int));
-            const tflags = c.fcntl(tfd, posix.F.GETFL, @as(c_int, 0));
-            if (tflags < 0 or
-                c.fcntl(tfd, posix.F.SETFL, tflags | @as(c_int, o_nonblock)) < 0 or
-                c.bind(tfd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in)) != 0 or
-                c.listen(tfd, 16) != 0)
+            const tfd = plat.openSocket(plat.AF_INET, plat.SOCK_STREAM, 0);
+            if (!plat.isValidSocket(tfd)) break :tcp;
+            _ = plat.setsockopt(tfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &one, @sizeOf(c_int));
+            if (!plat.is_windows)
+                _ = plat.setsockopt(tfd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &one, @sizeOf(c_int));
+            if (!plat.setNonblocking(tfd) or
+                plat.bind(tfd, &bind_addr, @sizeOf(posix.sockaddr.in)) != 0 or
+                plat.listen(tfd, 16) != 0)
             {
-                _ = c.close(tfd);
+                plat.closeSocket(tfd);
                 break :tcp;
             }
             tcp_listen = tfd;
@@ -546,7 +544,7 @@ pub const Mesh = struct {
         var hostname_buf: [max_hostname]u8 = undefined;
         var host_c: [256]u8 = @splat(0);
         var hostname_len: u8 = 0;
-        if (gethostname(&host_c, host_c.len - 1) == 0) {
+        if (plat.getHostname(host_c[0 .. host_c.len - 1])) {
             const len = std.mem.indexOfScalar(u8, &host_c, 0) orelse 0;
             const take = @min(len, max_hostname);
             @memcpy(hostname_buf[0..take], host_c[0..take]);
@@ -555,7 +553,7 @@ pub const Mesh = struct {
 
         // Random-enough node id; only needs to distinguish scanner instances
         // on one LAN, not resist an adversary
-        const pid: u32 = @bitCast(c.getpid());
+        const pid: u32 = plat.getpid();
         var node_id = splitmix64(@as(u64, @bitCast(common.wallMicros())));
         node_id ^= splitmix64(@as(u64, @bitCast(monotonicMicros())) ^ (@as(u64, pid) << 32));
 
@@ -612,8 +610,8 @@ pub const Mesh = struct {
         self.local_hosts.deinit();
         self.local_entries.deinit(self.allocator);
         self.poller.deinit();
-        if (self.tcp_listen >= 0) _ = c.close(self.tcp_listen);
-        _ = c.close(self.sock);
+        if (plat.isValidSocket(self.tcp_listen)) plat.closeSocket(self.tcp_listen);
+        plat.closeSocket(self.sock);
     }
 
     // Start the TCP probe thread. Call once the Mesh has its final address
@@ -727,7 +725,7 @@ pub const Mesh = struct {
     fn sendDatagram(self: *Mesh, data: []const u8, dest: *const posix.sockaddr.in) void {
         // Errors (buffer full, unreachable) are ignored: beacons and gossip
         // repeat on an interval, so a dropped datagram heals itself
-        _ = c.sendto(self.sock, data.ptr, data.len, 0, @ptrCast(dest), @sizeOf(posix.sockaddr.in));
+        _ = plat.sendto(self.sock, data, dest, @sizeOf(posix.sockaddr.in));
     }
 
     fn sendBeacons(self: *Mesh) void {
@@ -965,8 +963,8 @@ pub const Mesh = struct {
         var buf: [recv_buf_len]u8 = undefined;
         while (true) {
             var src: posix.sockaddr.in = undefined;
-            var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-            const rc = c.recvfrom(self.sock, &buf, buf.len, 0, @ptrCast(&src), &src_len);
+            var src_len: u32 = @sizeOf(posix.sockaddr.in);
+            const rc = plat.recvfrom(self.sock, &buf, &src, &src_len);
             if (rc <= 0) break;
             if (src.family != posix.AF.INET) continue;
             const parsed = parseMessage(buf[0..@intCast(rc)]) orelse continue;
@@ -1038,13 +1036,11 @@ pub const Mesh = struct {
     // RST (zero window) so probers get their timing without either side
     // accumulating open connections or TIME_WAIT state
     fn drainTcpAccepts(self: *Mesh) void {
-        if (self.tcp_listen < 0) return;
+        if (!plat.isValidSocket(self.tcp_listen)) return;
         while (true) {
-            const cfd = c.accept(self.tcp_listen, null, null);
-            if (cfd < 0) break;
-            const lo = c.linger{ .onoff = 1, .linger = 0 };
-            _ = c.setsockopt(@intCast(cfd), posix.SOL.SOCKET, posix.SO.LINGER, &lo, @sizeOf(c.linger));
-            _ = c.close(@intCast(cfd));
+            const cfd = plat.accept(self.tcp_listen);
+            if (!plat.isValidSocket(cfd)) break;
+            plat.rstClose(cfd);
         }
     }
 
