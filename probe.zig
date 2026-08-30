@@ -23,6 +23,12 @@ pub const max_batch = 64;
 // Rolling window of RTT samples per probed target
 pub const stats_window = 8;
 
+// Default probe timeout. Windows' TCP stack retries RST-refused connects
+// (two more SYNs, ~500ms and ~1s apart) before reporting WSAECONNREFUSED,
+// so a closed port needs ~1.5s to resolve there — under a 1s timeout every
+// refused probe would read as a miss. POSIX stacks fail on the first RST.
+pub const default_timeout_ms: u32 = if (plat.is_windows) 3000 else 1000;
+
 pub const TcpTarget = struct {
     ip: [4]u8,
     port: u16,
@@ -273,7 +279,7 @@ test "tcpProbeBatch measures open and closed loopback ports" {
 
     const addrs = [2]posix.sockaddr.in{ laddr, closed_addr };
     var results: [2]Outcome = undefined;
-    tcpProbeBatch(&addrs, &results, 1000);
+    tcpProbeBatch(&addrs, &results, default_timeout_ms);
 
     try testing.expect(results[0].rtt_us != null);
     try testing.expect(!results[0].refused);

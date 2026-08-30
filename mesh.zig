@@ -94,7 +94,7 @@ const udp_ping_max_rtt_us: i64 = 10 * std.time.us_per_s;
 // TCP probe rounds run on their own thread so connect() timing is never
 // quantized by the main loop's sleep granularity
 const tcp_probe_interval_us: i64 = 3 * std.time.us_per_s;
-const tcp_probe_timeout_ms: u32 = 1000;
+const tcp_probe_timeout_ms: u32 = probe.default_timeout_ms;
 
 const max_display_rows = 40;
 const max_display_observers = 6;
