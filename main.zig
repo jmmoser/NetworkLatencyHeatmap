@@ -4,6 +4,7 @@ const c = std.c;
 const builtin = @import("builtin");
 const common = @import("common.zig");
 const mesh_mod = @import("mesh.zig");
+const probe = @import("probe.zig");
 
 const SocketPoller = common.SocketPoller;
 const PingResult = common.PingResult;
@@ -172,6 +173,11 @@ const Config = struct {
     mesh: bool = false, // Share results with peers and render the mesh matrix
     mesh_port: u16 = mesh_mod.default_port,
     rescan_interval_s: u32 = 60, // Mesh mode: seconds between scans, 0 = scan once
+
+    // Extra TCP ping targets (--tcp-ping ip:port): hosts that aren't running
+    // this tool but answer a SYN on a known port with SYN-ACK or RST
+    tcp_targets: [probe.max_targets]probe.TcpTarget = undefined,
+    tcp_target_count: usize = 0,
 };
 
 // Per-host latency samples collected during Phase 2
@@ -998,11 +1004,18 @@ fn runScanOnce(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
 // Mesh mode: scan, share results with peers over UDP, render the combined
 // latency matrix, and rescan on an interval. Runs until interrupted.
 fn runMeshMode(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWriter, config: Config) !void {
-    var mesh = mesh_mod.Mesh.init(allocator, config.mesh_port, config.subnet, config.mask_bits) catch |err| {
+    var mesh = mesh_mod.Mesh.init(
+        allocator,
+        config.mesh_port,
+        config.subnet,
+        config.mask_bits,
+        config.tcp_targets[0..config.tcp_target_count],
+    ) catch |err| {
         std.debug.print("Error: failed to open mesh UDP socket on port {d}: {s}\n", .{ config.mesh_port, @errorName(err) });
         return err;
     };
     defer mesh.deinit();
+    try mesh.startProber();
 
     const rescan_us: i64 = @as(i64, config.rescan_interval_s) * std.time.us_per_s;
     var next_scan_at: i64 = monotonicMicros(); // first scan runs immediately
@@ -1078,9 +1091,14 @@ pub fn main(init: std.process.Init) !void {
                 \\  --mesh      Mesh mode: discover other instances of this tool on the
                 \\              LAN over UDP, share results, and render a live matrix of
                 \\              every host's latency from every vantage point
-                \\  --mesh-port <port>  UDP port for mesh discovery/gossip (default: 47269)
+                \\  --mesh-port <port>  UDP+TCP port for mesh discovery, gossip, and
+                \\              node-to-node probes (default: 47269)
                 \\  -i <sec>    Mesh mode: rescan interval in seconds, 0 = scan once
                 \\              (default: 60)
+                \\  --tcp-ping <ip:port>  Mesh mode: also TCP-ping this host on a known
+                \\              port (SYN→SYN-ACK, or RST from a closed port — both time
+                \\              the host's stack). Works on devices not running this
+                \\              tool; repeatable, up to 16 targets
                 \\  -h, --help  Show this help
                 \\
                 \\The subnet is auto-detected from your network interface if not specified.
@@ -1089,7 +1107,10 @@ pub fn main(init: std.process.Init) !void {
                 \\  Phase 1: Blasts pings to all IPs, waits for discovery timeout
                 \\  Phase 2: Measures latency only on hosts that responded
                 \\  Mesh:    Peers announce themselves via UDP broadcast beacons and
-                \\           gossip scan results; each node renders the combined matrix
+                \\           gossip scan results; each node renders the combined matrix.
+                \\           Nodes also measure each other directly with UDP echo pings
+                \\           and TCP connect pings (handshakes are torn down with an
+                \\           RST, zero window, so nothing lingers on either side)
                 \\
                 \\Note: Requires root/sudo for raw ICMP sockets on most systems.
                 \\
@@ -1123,6 +1144,16 @@ pub fn main(init: std.process.Init) !void {
             const value = nextArgValue(args, &i);
             config.rescan_interval_s = std.fmt.parseInt(u32, value, 10) catch
                 return invalidArgValue("-i", value);
+        } else if (std.mem.eql(u8, arg, "--tcp-ping")) {
+            const value = nextArgValue(args, &i);
+            const target = probe.parseTcpTarget(value) orelse
+                return invalidArgValue("--tcp-ping", value);
+            if (config.tcp_target_count >= probe.max_targets) {
+                std.debug.print("Error: at most {d} --tcp-ping targets\n", .{probe.max_targets});
+                std.process.exit(1);
+            }
+            config.tcp_targets[config.tcp_target_count] = target;
+            config.tcp_target_count += 1;
         } else if (!subnet_set) {
             const parsed = parseSubnet(arg) orelse {
                 std.debug.print("Error: unrecognized argument '{s}' (see --help)\n", .{arg});
@@ -1135,6 +1166,11 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("Error: unrecognized argument '{s}' (see --help)\n", .{arg});
             std.process.exit(1);
         }
+    }
+
+    if (config.tcp_target_count > 0 and !config.mesh) {
+        std.debug.print("Error: --tcp-ping targets are probed by mesh mode; add --mesh\n", .{});
+        std.process.exit(1);
     }
 
     // Print banner
@@ -1209,6 +1245,7 @@ const testing = std.testing;
 test {
     _ = @import("common.zig");
     _ = @import("mesh.zig");
+    _ = @import("probe.zig");
 }
 
 test "calculateChecksum verifies to zero over a packet containing its own checksum" {
