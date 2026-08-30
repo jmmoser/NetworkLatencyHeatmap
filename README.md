@@ -100,11 +100,15 @@ A single scanner sees the network from exactly one vantage point. `--mesh` remov
   192.168.1.1      █ 640µs      █ 812µs      ▓ 1.2ms
   192.168.1.42     ▓ 1.8ms      ▓ 2.1ms      ▒ 9.0ms      ◀ uneven
 
-  Direct probes from this node · UDP echo / TCP SYN→SYN-ACK · (rst) = closed port answered
-    laptop               udp 640µs         tcp 710µs
-    pi4                  udp 8.1ms         tcp 8.4ms
-    192.168.1.1:443      tcp 1.2ms
-    192.168.1.9:22       tcp 3.4ms (rst)
+  Node links · cell = from column node to row, udp/tcp avg · * = RST (closed port)
+  node             self         laptop       pi4
+  self             —            .5ms/.6ms    8.0ms/8.3ms
+  laptop           640µs/710µs  —            8.2ms/8.5ms
+  pi4              8.1ms/8.4ms  7.9ms/8.2ms  —
+
+  tcp target       self         laptop       pi4
+  192.168.1.1:443  1.2ms        1.3ms        9.0ms
+  192.168.1.9:22   3.4ms*       3.2ms*       ---
 
   ⚠ Insights:
     Observer pi4 sees a median of 8.2ms vs 900µs mesh-wide — its own link is likely the bottleneck
@@ -122,12 +126,14 @@ Incoming datagrams are treated as untrusted input: fixed caps on peers and hosts
 
 ### Node-to-node TCP and UDP pings
 
-The ICMP matrix shows how each node sees the *scanned hosts*; mesh nodes additionally probe **each other** directly, over both transports, and render the results in a `Direct probes` section:
+The ICMP matrix shows how each node sees the *scanned hosts*; mesh nodes additionally probe **each other** directly, over both transports:
 
 - **UDP echo ping**: each node unicasts a small ping to every peer on the beacon cadence; the peer echoes it back. The ping carries the sender's monotonic clock as an opaque token, so the pong timestamps itself and no state is kept per ping. A pong slower than 10s is discarded as stale.
 - **TCP connect ping**: each node listens on the mesh port over TCP, and peers time a full `SYN → SYN-ACK` handshake against it. The handshake is then torn down abortively — `SO_LINGER {on, 0s}`, so `close()` emits an **RST with a zero window** instead of a graceful FIN exchange — leaving no TIME_WAIT or half-open state on either side. The accepting node does the same to every connection it receives.
 
-Comparing the two against the ICMP numbers separates the network from the stack: ICMP is often handled in the kernel's fast path (or deprioritized by rate limits), while TCP handshakes and UDP sockets exercise the same path your actual traffic takes.
+These measurements are **gossiped like everything else**: every node broadcasts its link results (message type 5, one small datagram) on the beacon cadence, so every node renders the full node×node `Node links` matrix — each cell is the RTT from the column node to the row node — not just its own row. An asymmetric cell pair (A→B fast, B→A slow) points at a duplex or buffering problem a single vantage point can't see.
+
+Comparing UDP/TCP against the ICMP numbers separates the network from the stack: ICMP is often handled in the kernel's fast path (or deprioritized by rate limits), while TCP handshakes and UDP sockets exercise the same path your actual traffic takes.
 
 TCP probes run concurrently on a dedicated thread, so one unreachable target never delays the others and RTTs are taken at socket readiness rather than being quantized by the render loop.
 
@@ -140,6 +146,8 @@ sudo ./zig-out/bin/latency-heatmap --mesh --tcp-ping 192.168.1.1:443 --tcp-ping 
 ```
 
 Up to 16 targets can be given; each is probed every 3 seconds alongside the peer probes. (No response at all — a firewall silently dropping the SYN — yields no sample, and the target ages out of the display after a few consecutive misses.)
+
+Target results are gossiped too: the `tcp target` matrix shows the union of every node's targets as measured from every node, so a target configured on one node still gets a column from each vantage point that probes it (`---` where a node doesn't probe that target).
 
 ## Heatmap Legend
 

@@ -29,6 +29,17 @@
 //              (senders put their monotonic µs clock in it, so a pong is
 //              its own timestamp and no send-table is needed)
 //
+//   Links (type 5, broadcast every beacon interval): the sender's direct
+//   probe measurements, so every node can render the full node×node link
+//   matrix and every node's view of each TCP target:
+//     [13]     peer link count   (≤ max_peers)
+//     [14]     tcp target count  (≤ probe.max_targets)
+//     [15..)   peer links, 17 bytes each:
+//                node id u64, udp avg u32 µs, tcp avg u32 µs, flags u8
+//                (bit 0 = tcp sample was an RST; 0xFFFFFFFF = no data)
+//              then tcp targets, 11 bytes each:
+//                ip [4]u8 (network order), port u16, tcp avg u32 µs, flags u8
+//
 // Node↔node latency is also measured over TCP: each node listens on the
 // mesh port and peers time a SYN → SYN-ACK handshake against it, torn down
 // with an RST (zero window) rather than FIN so nothing lingers. See
@@ -60,6 +71,9 @@ const header_len = 13;
 const beacon_fixed_len = header_len + 7; // + seq, host_count, hostname_len
 const results_fixed_len = header_len + 10; // + seq, total, offset, count
 const ping_len = header_len + 8; // + token
+const links_fixed_len = header_len + 2; // + peer link count, target count
+const link_entry_len = 17; // node id, udp avg, tcp avg, flags
+const target_entry_len = 11; // ip, port, tcp avg, flags
 const entry_len = 16;
 const max_hostname = 32;
 const entries_per_chunk = 80; // 80*16 + 23 = 1303 bytes, under typical MTU
@@ -112,6 +126,24 @@ const MsgType = enum(u8) {
     results = 2,
     ping = 3,
     pong = 4,
+    links = 5,
+};
+
+// One gossiped node→node link measurement (avg over the sender's rolling
+// window; no_data when the sender has no fresh samples for that transport)
+pub const LinkEntry = struct {
+    node_id: u64, // the link's far end
+    udp_avg: u32,
+    tcp_avg: u32,
+    tcp_refused: bool, // tcp sample came from an RST, not a SYN-ACK
+};
+
+// One gossiped --tcp-ping target measurement
+pub const TargetEntry = struct {
+    ip: u32, // host byte order (as from ipToU32)
+    port: u16,
+    tcp_avg: u32,
+    refused: bool,
 };
 
 pub const Parsed = union(enum) {
@@ -135,6 +167,11 @@ pub const Parsed = union(enum) {
     pong: struct {
         node_id: u64,
         token: u64,
+    },
+    links: struct {
+        node_id: u64,
+        link_bytes: []const u8, // count * link_entry_len raw bytes
+        target_bytes: []const u8, // count * target_entry_len raw bytes
     },
 };
 
@@ -186,6 +223,48 @@ pub fn encodePong(buf: []u8, node_id: u64, token: u64) []const u8 {
     return encodeEcho(buf, .pong, node_id, token);
 }
 
+pub fn encodeLinks(buf: []u8, node_id: u64, links: []const LinkEntry, targets: []const TargetEntry) []const u8 {
+    writeHeader(buf, .links, node_id);
+    buf[13] = @intCast(links.len);
+    buf[14] = @intCast(targets.len);
+    var off: usize = links_fixed_len;
+    for (links) |l| {
+        std.mem.writeInt(u64, buf[off..][0..8], l.node_id, .little);
+        std.mem.writeInt(u32, buf[off + 8 ..][0..4], l.udp_avg, .little);
+        std.mem.writeInt(u32, buf[off + 12 ..][0..4], l.tcp_avg, .little);
+        buf[off + 16] = @intFromBool(l.tcp_refused);
+        off += link_entry_len;
+    }
+    for (targets) |t| {
+        const ip_bytes = u32ToIp(t.ip);
+        @memcpy(buf[off..][0..4], &ip_bytes);
+        std.mem.writeInt(u16, buf[off + 4 ..][0..2], t.port, .little);
+        std.mem.writeInt(u32, buf[off + 6 ..][0..4], t.tcp_avg, .little);
+        buf[off + 10] = @intFromBool(t.refused);
+        off += target_entry_len;
+    }
+    return buf[0..off];
+}
+
+pub fn decodeLinkEntry(bytes: []const u8) LinkEntry {
+    return .{
+        .node_id = std.mem.readInt(u64, bytes[0..8], .little),
+        .udp_avg = std.mem.readInt(u32, bytes[8..12], .little),
+        .tcp_avg = std.mem.readInt(u32, bytes[12..16], .little),
+        .tcp_refused = bytes[16] & 1 != 0,
+    };
+}
+
+pub fn decodeTargetEntry(bytes: []const u8) TargetEntry {
+    const ip_bytes: [4]u8 = bytes[0..4].*;
+    return .{
+        .ip = ipToU32(ip_bytes),
+        .port = std.mem.readInt(u16, bytes[4..6], .little),
+        .tcp_avg = std.mem.readInt(u32, bytes[6..10], .little),
+        .refused = bytes[10] & 1 != 0,
+    };
+}
+
 pub fn decodeEntry(bytes: []const u8) Entry {
     const ip_bytes: [4]u8 = bytes[0..4].*;
     return .{
@@ -235,6 +314,19 @@ pub fn parseMessage(buf: []const u8) ?Parsed {
                 .entries = buf[results_fixed_len..][0 .. count * entry_len],
             } };
         },
+        @intFromEnum(MsgType.links) => {
+            if (buf.len < links_fixed_len) return null;
+            const n_links: usize = buf[13];
+            const n_targets: usize = buf[14];
+            if (n_links > max_peers or n_targets > probe.max_targets) return null;
+            const links_len = n_links * link_entry_len;
+            if (buf.len < links_fixed_len + links_len + n_targets * target_entry_len) return null;
+            return .{ .links = .{
+                .node_id = node_id,
+                .link_bytes = buf[links_fixed_len..][0..links_len],
+                .target_bytes = buf[links_fixed_len + links_len ..][0 .. n_targets * target_entry_len],
+            } };
+        },
         @intFromEnum(MsgType.ping), @intFromEnum(MsgType.pong) => {
             if (buf.len < ping_len) return null;
             const token = std.mem.readInt(u64, buf[13..21], .little);
@@ -282,8 +374,30 @@ const Peer = struct {
     udp_stats: probe.ProbeStats,
     udp_ping_outstanding: bool,
 
+    // This peer's gossiped link measurements: its view of its own links to
+    // other nodes, and of its own --tcp-ping targets. Replaced wholesale on
+    // each links message (it is a full snapshot, not a delta).
+    links: [max_peers]LinkEntry,
+    link_count: u8,
+    remote_targets: [probe.max_targets]TargetEntry,
+    remote_target_count: u8,
+
     fn name(self: *const Peer) []const u8 {
         return self.hostname[0..self.hostname_len];
+    }
+
+    fn linkTo(self: *const Peer, node_id: u64) ?LinkEntry {
+        for (self.links[0..self.link_count]) |e| {
+            if (e.node_id == node_id) return e;
+        }
+        return null;
+    }
+
+    fn targetStats(self: *const Peer, ip: u32, port: u16) ?TargetEntry {
+        for (self.remote_targets[0..self.remote_target_count]) |e| {
+            if (e.ip == ip and e.port == port) return e;
+        }
+        return null;
     }
 };
 
@@ -669,6 +783,57 @@ pub const Mesh = struct {
         }
     }
 
+    // Broadcast our direct probe measurements so every node can render the
+    // full node×node link matrix, not just its own row. Everything fits one
+    // datagram (max ~750 bytes), so no chunking.
+    fn sendLinks(self: *Mesh) void {
+        var links: [max_peers]LinkEntry = undefined;
+        var n_links: usize = 0;
+        var targets: [probe.max_targets]TargetEntry = undefined;
+        var n_targets: usize = 0;
+        {
+            self.probes.mutex.lock();
+            defer self.probes.mutex.unlock();
+            for (self.peers.items) |*p| {
+                if (n_links >= max_peers) break;
+                var tcp_avg: u32 = no_data;
+                var refused = false;
+                for (self.probes.peer_tcp[0..self.probes.peer_tcp_count]) |entry| {
+                    if (entry.node_id == p.node_id) {
+                        if (entry.stats.alive()) {
+                            tcp_avg = clampStat(entry.stats.avg());
+                            refused = entry.stats.refused;
+                        }
+                        break;
+                    }
+                }
+                links[n_links] = .{
+                    .node_id = p.node_id,
+                    .udp_avg = if (p.udp_stats.alive()) clampStat(p.udp_stats.avg()) else no_data,
+                    .tcp_avg = tcp_avg,
+                    .tcp_refused = refused,
+                };
+                n_links += 1;
+            }
+            for (0..self.probes.extra_count) |i| {
+                const s = self.probes.extra_tcp[i];
+                const t = self.probes.extras[i];
+                targets[n_targets] = .{
+                    .ip = ipToU32(t.ip),
+                    .port = t.port,
+                    .tcp_avg = if (s.alive()) clampStat(s.avg()) else no_data,
+                    .refused = s.alive() and s.refused,
+                };
+                n_targets += 1;
+            }
+        }
+        if (n_links == 0 and n_targets == 0) return;
+
+        var buf: [links_fixed_len + max_peers * link_entry_len + probe.max_targets * target_entry_len]u8 = undefined;
+        const msg = encodeLinks(&buf, self.node_id, links[0..n_links], targets[0..n_targets]);
+        for (&self.bcast_addrs) |*addr| self.sendDatagram(msg, addr);
+    }
+
     fn findPeer(self: *Mesh, node_id: u64) ?*Peer {
         for (self.peers.items) |*p| {
             if (p.node_id == node_id) return p;
@@ -696,6 +861,10 @@ pub const Mesh = struct {
             .hosts = std.AutoHashMap(u32, HostStats).init(self.allocator),
             .udp_stats = .{},
             .udp_ping_outstanding = false,
+            .links = undefined,
+            .link_count = 0,
+            .remote_targets = undefined,
+            .remote_target_count = 0,
         }) catch return null;
         self.dirty = true;
 
@@ -755,6 +924,27 @@ pub const Mesh = struct {
                 peer.udp_ping_outstanding = false;
                 self.dirty = true;
             },
+            .links => |l| {
+                if (l.node_id == self.node_id) return;
+                const peer = self.obtainPeer(l.node_id, src, now) orelse return;
+                // Full snapshot: replace what we held (parse already capped
+                // both counts at the storage sizes)
+                var i: usize = 0;
+                var off: usize = 0;
+                while (off < l.link_bytes.len) : (off += link_entry_len) {
+                    peer.links[i] = decodeLinkEntry(l.link_bytes[off..][0..link_entry_len]);
+                    i += 1;
+                }
+                peer.link_count = @intCast(i);
+                i = 0;
+                off = 0;
+                while (off < l.target_bytes.len) : (off += target_entry_len) {
+                    peer.remote_targets[i] = decodeTargetEntry(l.target_bytes[off..][0..target_entry_len]);
+                    i += 1;
+                }
+                peer.remote_target_count = @intCast(i);
+                self.dirty = true;
+            },
         }
     }
 
@@ -781,6 +971,7 @@ pub const Mesh = struct {
             self.sendBeacons();
             self.expirePeers(now);
             self.sendPeerPings();
+            self.sendLinks();
         }
         if (self.local_entries.items.len > 0 and now - self.last_gossip_us >= gossip_interval_us) {
             self.last_gossip_us = now;
@@ -841,6 +1032,7 @@ pub const Mesh = struct {
     const Observer = struct {
         label_buf: [16]u8,
         label_len: usize,
+        node_id: u64,
         hosts: *const std.AutoHashMap(u32, HostStats),
         age_us: i64, // since this observer's data was produced/received
 
@@ -849,10 +1041,11 @@ pub const Mesh = struct {
         }
     };
 
-    fn makeObserver(label_text: []const u8, hosts: *const std.AutoHashMap(u32, HostStats), age_us: i64) Observer {
+    fn makeObserver(label_text: []const u8, node_id: u64, hosts: *const std.AutoHashMap(u32, HostStats), age_us: i64) Observer {
         var o = Observer{
             .label_buf = undefined,
             .label_len = 0,
+            .node_id = node_id,
             .hosts = hosts,
             .age_us = age_us,
         };
@@ -873,7 +1066,7 @@ pub const Mesh = struct {
         // Assemble the observer columns: self first, then live peers
         var observers: [1 + max_peers]Observer = undefined;
         var num_obs: usize = 0;
-        observers[0] = makeObserver("self", &self.local_hosts, if (self.local_scan_us > 0) now - self.local_scan_us else -1);
+        observers[0] = makeObserver("self", self.node_id, &self.local_hosts, if (self.local_scan_us > 0) now - self.local_scan_us else -1);
         num_obs = 1;
         for (self.peers.items) |*p| {
             if (num_obs >= observers.len) break;
@@ -881,7 +1074,7 @@ pub const Mesh = struct {
             const peer_ip: [4]u8 = @bitCast(p.addr.addr);
             const label_text = if (p.hostname_len > 0) p.name() else ipToString(peer_ip, &ip_buf);
             const age: i64 = if (p.last_results_us > 0) now - p.last_results_us else -1;
-            observers[num_obs] = makeObserver(label_text, &p.hosts, age);
+            observers[num_obs] = makeObserver(label_text, p.node_id, &p.hosts, age);
             num_obs += 1;
         }
         const shown_obs = @min(num_obs, max_display_observers);
@@ -983,21 +1176,55 @@ pub const Mesh = struct {
 
         stdout.print("\n  {s}avg latency as seen from each observer · {s}◀ uneven{s}{s} = slowest vantage ≥3x fastest{s}\n", .{ gray, "\x1b[93m", reset, gray, reset }) catch {};
 
-        self.renderProbes(stdout);
+        self.renderLinks(stdout, observers[0..num_obs], shown_obs);
         self.renderInsights(stdout, observers[0..num_obs], rows.items, uneven_count);
     }
 
-    // Node↔node link section: RTT from this node to each peer over UDP
-    // (ping/pong echo) and TCP (SYN → SYN-ACK), plus any --tcp-ping targets.
-    // Unlike the matrix these are measured directly rather than gossiped,
-    // so each node prints its own view of its links.
-    fn renderProbes(self: *Mesh, stdout: StdoutWriter) void {
-        const label_width = 21;
-        const pad = " " ** 32;
-        const gray = "\x1b[90m";
-        const reset = "\x1b[0m";
+    const Link = struct { udp: ?u64, tcp: ?u64, refused: bool };
 
-        // Copy the prober's results out under the lock; print unlocked
+    fn statToOpt(v: u32) ?u64 {
+        return if (v == no_data) null else v;
+    }
+
+    // The link from observer `from` to node `to_id`, as this node knows it:
+    // our own live measurements when `from` is us, the peer's gossiped
+    // snapshot otherwise.
+    fn linkBetween(self: *Mesh, from: *const Observer, to_id: u64, peer_tcp: []const PeerTcp) Link {
+        const none = Link{ .udp = null, .tcp = null, .refused = false };
+        if (from.node_id == self.node_id) {
+            const p = self.findPeer(to_id) orelse return none;
+            var link = Link{
+                .udp = if (p.udp_stats.alive()) p.udp_stats.avg() else null,
+                .tcp = null,
+                .refused = false,
+            };
+            for (peer_tcp) |e| {
+                if (e.node_id == to_id and e.stats.alive()) {
+                    link.tcp = e.stats.avg();
+                    link.refused = e.stats.refused;
+                    break;
+                }
+            }
+            return link;
+        }
+        const p = self.findPeer(from.node_id) orelse return none;
+        const e = p.linkTo(to_id) orelse return none;
+        return .{ .udp = statToOpt(e.udp_avg), .tcp = statToOpt(e.tcp_avg), .refused = e.tcp_refused };
+    }
+
+    // Node↔node link matrix, plus every node's view of the --tcp-ping
+    // targets. The self column comes from our own probes; every other
+    // column from that peer's gossiped links message, so all nodes converge
+    // on the same picture from any seat.
+    fn renderLinks(self: *Mesh, stdout: StdoutWriter, observers: []const Observer, shown_obs: usize) void {
+        const reset = "\x1b[0m";
+        const bold = "\x1b[1m";
+        const gray = "\x1b[90m";
+        const col_width = 13;
+        const label_width = 17;
+        const pad = " " ** 32;
+
+        // Copy the prober's results out under the lock; render unlocked
         var peer_tcp: [max_peers]PeerTcp = undefined;
         var peer_tcp_count: usize = 0;
         var extras: [probe.max_targets]probe.TcpTarget = undefined;
@@ -1013,58 +1240,134 @@ pub const Mesh = struct {
             @memcpy(extra_tcp[0..extra_count], self.probes.extra_tcp[0..extra_count]);
         }
 
-        if (self.peers.items.len == 0 and extra_count == 0) return;
-
-        stdout.print("\n  {s}Direct probes from this node{s} {s}· UDP echo / TCP SYN→SYN-ACK · (rst) = closed port answered{s}\n", .{
-            "\x1b[1m", reset, gray, reset,
-        }) catch {};
-
-        for (self.peers.items) |*p| {
-            var ip_buf: [16]u8 = undefined;
-            const peer_ip: [4]u8 = @bitCast(p.addr.addr);
-            const label = if (p.hostname_len > 0) p.name() else ipToString(peer_ip, &ip_buf);
-            const shown = label[0..@min(label.len, label_width - 1)];
-            stdout.print("    {s}{s}", .{ shown, pad[0 .. label_width - shown.len] }) catch {};
-
-            printProbeCell(stdout, "udp", if (p.udp_stats.alive()) p.udp_stats.avg() else null, false);
-
-            var tcp_stats = probe.ProbeStats{};
-            for (peer_tcp[0..peer_tcp_count]) |entry| {
-                if (entry.node_id == p.node_id) {
-                    tcp_stats = entry.stats;
-                    break;
+        // Union of TCP targets: ours plus everything peers gossip
+        const TargetKey = struct { ip: u32, port: u16 };
+        var target_keys: [32]TargetKey = undefined;
+        var n_targets: usize = 0;
+        for (extras[0..extra_count]) |t| {
+            if (n_targets >= target_keys.len) break;
+            target_keys[n_targets] = .{ .ip = ipToU32(t.ip), .port = t.port };
+            n_targets += 1;
+        }
+        outer: for (self.peers.items) |*p| {
+            for (p.remote_targets[0..p.remote_target_count]) |e| {
+                if (n_targets >= target_keys.len) break :outer;
+                var seen = false;
+                for (target_keys[0..n_targets]) |k| {
+                    if (k.ip == e.ip and k.port == e.port) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    target_keys[n_targets] = .{ .ip = e.ip, .port = e.port };
+                    n_targets += 1;
                 }
             }
-            printProbeCell(stdout, "tcp", if (tcp_stats.alive()) tcp_stats.avg() else null, tcp_stats.alive() and tcp_stats.refused);
-            stdout.print("\n", .{}) catch {};
         }
 
-        for (extras[0..extra_count], 0..) |t, i| {
-            var ip_buf: [16]u8 = undefined;
-            var label_buf: [24]u8 = undefined;
-            const label = std.fmt.bufPrint(&label_buf, "{s}:{d}", .{ ipToString(t.ip, &ip_buf), t.port }) catch "?";
-            const shown = label[0..@min(label.len, label_width - 1)];
-            stdout.print("    {s}{s}", .{ shown, pad[0 .. label_width - shown.len] }) catch {};
-            const s = extra_tcp[i];
-            printProbeCell(stdout, "tcp", if (s.alive()) s.avg() else null, s.alive() and s.refused);
+        if (observers.len <= 1 and n_targets == 0) return;
+
+        stdout.print("\n  {s}Node links{s} {s}· cell = from column node to row, udp/tcp avg · * = RST (closed port){s}\n", .{
+            bold, reset, gray, reset,
+        }) catch {};
+
+        if (observers.len > 1) {
+            stdout.print("  {s}node{s}{s}", .{ bold, reset, pad[0 .. label_width - 4] }) catch {};
+            for (observers[0..shown_obs]) |*o| {
+                const l = o.label()[0..@min(o.label().len, col_width - 1)];
+                stdout.print("{s}{s}{s}{s}", .{ bold, l, reset, pad[0 .. col_width - l.len] }) catch {};
+            }
             stdout.print("\n", .{}) catch {};
+
+            for (observers) |*row| {
+                const l = row.label()[0..@min(row.label().len, label_width - 1)];
+                stdout.print("  {s}{s}", .{ l, pad[0 .. label_width - l.len] }) catch {};
+                for (observers[0..shown_obs]) |*col| {
+                    if (col.node_id == row.node_id) {
+                        stdout.print("{s}—{s}{s}", .{ gray, reset, pad[0 .. col_width - 1] }) catch {};
+                        continue;
+                    }
+                    printLinkCell(stdout, self.linkBetween(col, row.node_id, peer_tcp[0..peer_tcp_count]), col_width);
+                }
+                stdout.print("\n", .{}) catch {};
+            }
+        }
+
+        if (n_targets > 0) {
+            if (observers.len > 1) stdout.print("\n", .{}) catch {};
+            stdout.print("  {s}tcp target{s}{s}", .{ bold, reset, pad[0 .. label_width - 10] }) catch {};
+            for (observers[0..shown_obs]) |*o| {
+                const l = o.label()[0..@min(o.label().len, col_width - 1)];
+                stdout.print("{s}{s}{s}{s}", .{ bold, l, reset, pad[0 .. col_width - l.len] }) catch {};
+            }
+            stdout.print("\n", .{}) catch {};
+
+            for (target_keys[0..n_targets]) |k| {
+                var ip_buf: [16]u8 = undefined;
+                var label_buf: [24]u8 = undefined;
+                const label = std.fmt.bufPrint(&label_buf, "{s}:{d}", .{ ipToString(u32ToIp(k.ip), &ip_buf), k.port }) catch "?";
+                const shown = label[0..@min(label.len, label_width - 1)];
+                stdout.print("  {s}{s}", .{ shown, pad[0 .. label_width - shown.len] }) catch {};
+
+                for (observers[0..shown_obs]) |*col| {
+                    if (col.node_id == self.node_id) {
+                        var avg: ?u64 = null;
+                        var refused = false;
+                        for (extras[0..extra_count], 0..) |t, i| {
+                            if (ipToU32(t.ip) == k.ip and t.port == k.port and extra_tcp[i].alive()) {
+                                avg = extra_tcp[i].avg();
+                                refused = extra_tcp[i].refused;
+                                break;
+                            }
+                        }
+                        printTcpCell(stdout, avg, refused, col_width);
+                    } else if (self.findPeer(col.node_id)) |p| {
+                        if (p.targetStats(k.ip, k.port)) |e| {
+                            printTcpCell(stdout, statToOpt(e.tcp_avg), e.refused, col_width);
+                        } else {
+                            printTcpCell(stdout, null, false, col_width);
+                        }
+                    } else {
+                        printTcpCell(stdout, null, false, col_width);
+                    }
+                }
+                stdout.print("\n", .{}) catch {};
+            }
         }
     }
 
-    fn printProbeCell(stdout: StdoutWriter, proto: []const u8, avg_us: ?u64, refused: bool) void {
-        const cell_width = 18;
-        const pad = " " ** 32;
-        const gray = "\x1b[90m";
+    fn printLinkCell(stdout: StdoutWriter, link: Link, col_width: usize) void {
         const reset = "\x1b[0m";
-        var lat_buf: [16]u8 = undefined;
-        const lat = formatLatency(avg_us, &lat_buf);
-        stdout.print("{s}{s}{s} {s}{s}{s}", .{ gray, proto, reset, latencyToColor(avg_us), lat, reset }) catch {};
-        var used = proto.len + 1 + displayWidth(lat);
-        if (refused) {
-            stdout.print(" {s}(rst){s}", .{ gray, reset }) catch {};
-            used += 6;
+        const gray = "\x1b[90m";
+        const pad = " " ** 32;
+        if (link.udp == null and link.tcp == null) {
+            stdout.print("{s}---{s}{s}", .{ gray, reset, pad[0 .. col_width - 3] }) catch {};
+            return;
         }
-        stdout.print("{s}", .{pad[0..@max(1, cell_width - @min(used, cell_width - 1))]}) catch {};
+        var u_buf: [16]u8 = undefined;
+        var t_buf: [16]u8 = undefined;
+        const u_str = formatLatency(link.udp, &u_buf);
+        const t_str = formatLatency(link.tcp, &t_buf);
+        // Color the cell by the slower transport — the interesting one
+        const worst = @max(link.udp orelse 0, link.tcp orelse 0);
+        const star = if (link.refused and link.tcp != null) "*" else "";
+        stdout.print("{s}{s}/{s}{s}{s}", .{ latencyToColor(worst), u_str, t_str, star, reset }) catch {};
+        const used = displayWidth(u_str) + 1 + displayWidth(t_str) + star.len;
+        stdout.print("{s}", .{pad[0..@max(1, col_width - @min(used, col_width - 1))]}) catch {};
+    }
+
+    fn printTcpCell(stdout: StdoutWriter, avg_us: ?u64, refused: bool, col_width: usize) void {
+        const reset = "\x1b[0m";
+        const gray = "\x1b[90m";
+        const pad = " " ** 32;
+        var buf: [16]u8 = undefined;
+        const s = formatLatency(avg_us, &buf);
+        const star = if (refused and avg_us != null) "*" else "";
+        const color = if (avg_us == null) gray else latencyToColor(avg_us);
+        stdout.print("{s}{s}{s}{s}", .{ color, s, star, reset }) catch {};
+        const used = displayWidth(s) + star.len;
+        stdout.print("{s}", .{pad[0..@max(1, col_width - @min(used, col_width - 1))]}) catch {};
     }
 
     // Column-level analysis: an observer whose median latency to everything
@@ -1174,6 +1477,62 @@ test "ping and pong round-trip through encode and parse" {
     const pong = parseMessage(encodePong(&buf, 42, 99)).?;
     try testing.expectEqual(@as(u64, 42), pong.pong.node_id);
     try testing.expectEqual(@as(u64, 99), pong.pong.token);
+}
+
+test "links message round-trips peer links and tcp targets" {
+    const links = [_]LinkEntry{
+        .{ .node_id = 0xAAAA, .udp_avg = 640, .tcp_avg = 810, .tcp_refused = false },
+        .{ .node_id = 0xBBBB, .udp_avg = no_data, .tcp_avg = 1200, .tcp_refused = true },
+    };
+    const targets = [_]TargetEntry{
+        .{ .ip = ipToU32(.{ 192, 168, 1, 1 }), .port = 443, .tcp_avg = 2100, .refused = false },
+        .{ .ip = ipToU32(.{ 192, 168, 1, 9 }), .port = 22, .tcp_avg = no_data, .refused = false },
+    };
+    var buf: [links_fixed_len + max_peers * link_entry_len + probe.max_targets * target_entry_len]u8 = undefined;
+    const msg = encodeLinks(&buf, 77, &links, &targets);
+    const parsed = parseMessage(msg).?;
+    try testing.expectEqual(@as(u64, 77), parsed.links.node_id);
+    try testing.expectEqual(@as(usize, 2 * link_entry_len), parsed.links.link_bytes.len);
+    try testing.expectEqual(@as(usize, 2 * target_entry_len), parsed.links.target_bytes.len);
+
+    const l0 = decodeLinkEntry(parsed.links.link_bytes[0..link_entry_len]);
+    try testing.expectEqual(links[0], l0);
+    const l1 = decodeLinkEntry(parsed.links.link_bytes[link_entry_len .. 2 * link_entry_len]);
+    try testing.expectEqual(links[1], l1);
+    try testing.expect(l1.tcp_refused);
+
+    const t0 = decodeTargetEntry(parsed.links.target_bytes[0..target_entry_len]);
+    try testing.expectEqual(targets[0], t0);
+    const t1 = decodeTargetEntry(parsed.links.target_bytes[target_entry_len .. 2 * target_entry_len]);
+    try testing.expectEqual(targets[1], t1);
+}
+
+test "parseMessage rejects malformed links messages" {
+    const links = [_]LinkEntry{
+        .{ .node_id = 1, .udp_avg = 10, .tcp_avg = 20, .tcp_refused = false },
+    };
+    var buf: [links_fixed_len + max_peers * link_entry_len]u8 = undefined;
+    const msg = encodeLinks(&buf, 1, &links, &.{});
+
+    // Truncated payload
+    try testing.expect(parseMessage(msg[0 .. msg.len - 1]) == null);
+
+    // Counts over the caps
+    var over_links: [links_fixed_len + link_entry_len]u8 = undefined;
+    @memcpy(&over_links, msg[0 .. links_fixed_len + link_entry_len]);
+    over_links[13] = max_peers + 1;
+    try testing.expect(parseMessage(&over_links) == null);
+
+    var over_targets: [links_fixed_len + link_entry_len]u8 = undefined;
+    @memcpy(&over_targets, msg[0 .. links_fixed_len + link_entry_len]);
+    over_targets[14] = probe.max_targets + 1;
+    try testing.expect(parseMessage(&over_targets) == null);
+
+    // Count claiming more entries than the datagram carries
+    var lying: [links_fixed_len + link_entry_len]u8 = undefined;
+    @memcpy(&lying, msg[0 .. links_fixed_len + link_entry_len]);
+    lying[13] = 2;
+    try testing.expect(parseMessage(&lying) == null);
 }
 
 test "parseMessage rejects a truncated ping" {
