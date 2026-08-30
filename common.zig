@@ -8,6 +8,37 @@ const builtin = @import("builtin");
 // Writer interface type for Zig 0.16
 pub const StdoutWriter = *std.Io.Writer;
 
+// Terminal capabilities, set once at startup by initTerm. Color and the
+// \r-rewriting progress lines are only emitted when stdout is a TTY (and
+// color can be disabled explicitly via --no-color or the NO_COLOR env var,
+// see https://no-color.org).
+pub var stdout_is_tty: bool = false;
+pub var color_enabled: bool = false;
+
+extern "c" fn isatty(fd: c_int) c_int;
+
+pub fn initTerm(no_color_flag: bool) void {
+    stdout_is_tty = isatty(posix.STDOUT_FILENO) == 1;
+    // Per https://no-color.org, NO_COLOR disables color when set to any
+    // non-empty value
+    const no_color_env = c.getenv("NO_COLOR");
+    const no_color_set = no_color_env != null and no_color_env.?[0] != 0;
+    color_enabled = stdout_is_tty and !no_color_flag and !no_color_set;
+}
+
+// Gate an ANSI SGR escape on color support: returns the code unchanged when
+// color is enabled, "" otherwise. Call sites format with {s} so disabled
+// colors collapse to nothing.
+pub fn sgr(code: []const u8) []const u8 {
+    return if (color_enabled) code else "";
+}
+
+// Carriage-return prefix for lines that overwrite an in-place progress
+// line: "\r" on a TTY, "" when output is piped (no progress lines then)
+pub fn cr() []const u8 {
+    return if (stdout_is_tty) "\r" else "";
+}
+
 pub const PingResult = struct {
     ip: [4]u8,
     latency_us: ?u64, // microseconds, null if timeout (min latency)
@@ -142,6 +173,7 @@ pub fn ipToString(ip: [4]u8, buf: []u8) []const u8 {
 }
 
 pub fn latencyToColor(latency_us: ?u64) []const u8 {
+    if (!color_enabled) return "";
     if (latency_us == null) return "\x1b[90m"; // Gray - offline
 
     const lat = latency_us.?;
@@ -223,6 +255,21 @@ test "displayWidth ignores ANSI escapes and counts multi-byte chars once" {
     try testing.expectEqual(@as(usize, 3), displayWidth("abc"));
     try testing.expectEqual(@as(usize, 5), displayWidth("\x1b[92m1.2ms\x1b[0m"));
     try testing.expectEqual(@as(usize, 5), displayWidth("123µs"));
+}
+
+test "sgr and latencyToColor collapse to nothing when color is disabled" {
+    const saved = color_enabled;
+    defer color_enabled = saved;
+
+    color_enabled = false;
+    try testing.expectEqualStrings("", sgr("\x1b[92m"));
+    try testing.expectEqualStrings("", latencyToColor(500));
+    try testing.expectEqualStrings("", latencyToColor(null));
+
+    color_enabled = true;
+    try testing.expectEqualStrings("\x1b[92m", sgr("\x1b[92m"));
+    try testing.expectEqualStrings("\x1b[92m", latencyToColor(500));
+    try testing.expectEqualStrings("\x1b[90m", latencyToColor(null));
 }
 
 test "monotonicMicros is nondecreasing" {

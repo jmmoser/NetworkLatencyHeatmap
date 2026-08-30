@@ -1,5 +1,7 @@
 # Network Latency Heatmap Scanner
 
+[![CI](https://github.com/jmmoser/NetworkLatencyHeatmap/actions/workflows/ci.yml/badge.svg)](https://github.com/jmmoser/NetworkLatencyHeatmap/actions/workflows/ci.yml)
+
 A fast network scanner that discovers hosts on your network and measures their latency, displaying results as a visual heatmap.
 
 ## Features
@@ -10,13 +12,15 @@ A fast network scanner that discovers hosts on your network and measures their l
 - **Visual heatmap**: Color-coded latency display to quickly identify slow devices
 - **Concurrent scanning**: Uses separate sender/receiver threads for maximum throughput
 - **Large subnet support**: Can scan /16 networks (65k+ hosts) efficiently
+- **Default-route-aware auto-detection**: With no subnet argument, the scanner picks the interface carrying the default route (not just the first one up), so VPN tunnels, VM bridges, and container networks don't hijack the scan — the chosen interface is printed so you can verify
+- **Pipe-friendly output**: Colors and in-place progress bars are emitted only on a terminal; redirect to a file and you get plain text (`--no-color` and the `NO_COLOR` env var also disable color)
 - **Mesh mode**: Run the scanner on several devices and they discover each other over UDP, gossip their results, and each render a live matrix of every host's latency from every vantage point
 
 ## Requirements
 
 - macOS (kqueue) or Linux (epoll) — uses raw ICMP sockets
 - Root privileges (sudo) for raw socket access
-- Zig 0.15+
+- Zig 0.16+
 
 ## Building
 
@@ -65,6 +69,7 @@ sudo ./zig-out/bin/latency-heatmap --mesh
 | `--mesh` | Mesh mode: discover peers, share results, render the combined matrix | off |
 | `--mesh-port <port>` | UDP port for mesh discovery and gossip | 47269 |
 | `-i <sec>` | Mesh mode: rescan interval in seconds (0 = scan once) | 60 |
+| `--no-color` | Disable colored output (also off when stdout is not a terminal or `NO_COLOR` is set) | |
 | `-h, --help` | Show help message | |
 
 ## How It Works
@@ -78,6 +83,7 @@ sudo ./zig-out/bin/latency-heatmap --mesh
    - For each discovered host, sends multiple pings
    - Reply arrival times come from kernel timestamps (`SCM_TIMESTAMP`), not userspace clocks, so scheduling jitter is excluded from the samples
    - Records min/avg/max latency for each host
+   - The early-exit silence window scales with the slowest RTT observed so far, so replies from high-latency hosts still in flight aren't clipped by a burst of fast responders finishing first
    - Displays results with color-coded heatmap
 
 The phases are deliberately sequential: latency is measured in a quiet window after the discovery blast, so probes never compete with the scanner's own traffic for the NIC and socket buffers.
@@ -104,7 +110,7 @@ Comparing the same host from multiple vantage points localizes problems a single
 - A host slow from **some** observers (`◀ uneven`) points at a link, switch, or AP between network segments
 - An observer that measures **everything** slow has a bad uplink of its own — the insight section calls this out
 
-How it works: each node broadcasts a small UDP beacon every 2 seconds to announce itself, and gossips its scan results (chunked to fit under the MTU) every 5 seconds plus immediately to newly joined peers. There is no coordinator — every node converges on the full matrix and renders it live. By default each node rescans every 60 seconds (`-i` changes this; `-i 0` scans once and keeps sharing). Mesh traffic is deliberately phase-separated from measurement: gossip only queues while a scan is running, so the mesh never competes with its own probes.
+How it works: each node broadcasts a small UDP beacon every 2 seconds to announce itself, and gossips its scan results (chunked to fit under the MTU) every 5 seconds plus immediately to newly joined peers. There is no coordinator — every node converges on the full matrix and renders it live. By default each node rescans every 60 seconds (`-i` changes this; `-i 0` scans once and keeps sharing). Mesh traffic is deliberately phase-separated from measurement: while a scan runs, only the tiny beacons keep flowing (so a long scan doesn't get the node dropped from its peers' tables, and incoming datagrams keep being drained), while result gossip is deferred until the scan completes — the mesh never competes with its own probes.
 
 Incoming datagrams are treated as untrusted input: fixed caps on peers and hosts, strict length validation, and anything malformed or from a different protocol version is dropped silently.
 
