@@ -2,6 +2,23 @@ const std = @import("std");
 const posix = std.posix;
 const c = std.c;
 const builtin = @import("builtin");
+const common = @import("common.zig");
+const mesh_mod = @import("mesh.zig");
+
+const SocketPoller = common.SocketPoller;
+const PingResult = common.PingResult;
+const StdoutWriter = common.StdoutWriter;
+const ipToU32 = common.ipToU32;
+const u32ToIp = common.u32ToIp;
+const clockMicros = common.clockMicros;
+const monotonicMicros = common.monotonicMicros;
+const wallMicros = common.wallMicros;
+const sleepNanos = common.sleepNanos;
+const ipToString = common.ipToString;
+const latencyToColor = common.latencyToColor;
+const latencyToBlock = common.latencyToBlock;
+const formatLatency = common.formatLatency;
+const displayWidth = common.displayWidth;
 
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
@@ -76,88 +93,6 @@ fn detectLocalSubnet() ?struct { subnet: [4]u8, mask: u8 } {
     return null;
 }
 
-// Platform-agnostic event poller for socket readiness
-const SocketPoller = struct {
-    // Use kqueue on macOS/BSD, epoll on Linux
-    const is_darwin = builtin.os.tag == .macos or builtin.os.tag == .ios or
-        builtin.os.tag == .watchos or builtin.os.tag == .tvos or
-        builtin.os.tag == .freebsd or builtin.os.tag == .netbsd or
-        builtin.os.tag == .openbsd or builtin.os.tag == .dragonfly;
-
-    const is_linux = builtin.os.tag == .linux;
-
-    fd: posix.fd_t,
-    sock: posix.fd_t,
-
-    pub fn init(sock: posix.fd_t) !SocketPoller {
-        if (is_darwin) {
-            const kq = c.kqueue();
-            if (kq < 0) return error.PollerInitFailed;
-            // Register socket for read events
-            const changelist = [_]c.Kevent{.{
-                .ident = @intCast(sock),
-                .filter = c.EVFILT.READ,
-                .flags = c.EV.ADD,
-                .fflags = 0,
-                .data = 0,
-                .udata = 0,
-            }};
-            var events: [1]c.Kevent = undefined;
-            if (c.kevent(kq, &changelist, changelist.len, &events, 0, null) < 0)
-                return error.PollerInitFailed;
-            return .{ .fd = kq, .sock = sock };
-        } else if (is_linux) {
-            const epfd = c.epoll_create1(0);
-            if (epfd < 0) return error.PollerInitFailed;
-            var ev = std.os.linux.epoll_event{
-                .events = std.os.linux.EPOLL.IN,
-                .data = .{ .fd = sock },
-            };
-            if (c.epoll_ctl(epfd, std.os.linux.EPOLL.CTL_ADD, sock, &ev) < 0)
-                return error.PollerInitFailed;
-            return .{ .fd = epfd, .sock = sock };
-        } else {
-            // Fallback: no event fd, will use polling
-            return .{ .fd = -1, .sock = sock };
-        }
-    }
-
-    pub fn deinit(self: *SocketPoller) void {
-        if (self.fd >= 0) {
-            _ = c.close(self.fd);
-        }
-    }
-
-    // Wait for socket to be readable, returns true if data available, false on timeout
-    // timeout_ms: max time to wait in milliseconds
-    pub fn wait(self: *SocketPoller, timeout_ms: u32) bool {
-        if (is_darwin) {
-            const timeout = c.timespec{
-                .sec = @intCast(timeout_ms / 1000),
-                .nsec = @intCast((timeout_ms % 1000) * 1_000_000),
-            };
-            var events: [1]c.Kevent = undefined;
-            const n = c.kevent(self.fd, &[_]c.Kevent{}, 0, &events, events.len, &timeout);
-            return n > 0;
-        } else if (is_linux) {
-            var events: [1]std.os.linux.epoll_event = undefined;
-            const n = c.epoll_wait(self.fd, &events, events.len, @intCast(timeout_ms));
-            return n > 0;
-        } else {
-            // Fallback: block in poll(2) until the socket is readable or the
-            // timeout elapses.
-            var fds = [_]posix.pollfd{.{ .fd = self.sock, .events = posix.POLL.IN, .revents = 0 }};
-            const n = posix.poll(&fds, @intCast(timeout_ms)) catch return false;
-            return n > 0;
-        }
-    }
-
-    // Non-blocking check if data is available (timeout = 0)
-    pub fn poll(self: *SocketPoller) bool {
-        return self.wait(0);
-    }
-};
-
 // Kernel receive timestamps: with SO_TIMESTAMP enabled, the kernel records
 // each packet's arrival time as it enters the network stack and delivers it
 // via recvmsg ancillary data (SCM_TIMESTAMP + struct timeval). Using that
@@ -228,19 +163,15 @@ const IcmpHeader = extern struct {
     sequence: u16,
 };
 
-const PingResult = struct {
-    ip: [4]u8,
-    latency_us: ?u64, // microseconds, null if timeout (min latency)
-    latency_avg: ?u64, // average latency
-    latency_max: ?u64, // max latency
-};
-
 const Config = struct {
     subnet: [4]u8 = .{ 192, 168, 1, 0 },
     mask_bits: u8 = 24,
     discovery_timeout_ms: u32 = 1000, // Time to wait for discovery responses
     latency_pings: u8 = 5, // Number of pings per host for latency measurement
     latency_timeout_ms: u32 = 1000, // Timeout per ping in latency phase
+    mesh: bool = false, // Share results with peers and render the mesh matrix
+    mesh_port: u16 = mesh_mod.default_port,
+    rescan_interval_s: u32 = 60, // Mesh mode: seconds between scans, 0 = scan once
 };
 
 // Per-host latency samples collected during Phase 2
@@ -293,9 +224,6 @@ const LatencyData = struct {
     }
 };
 
-// Writer interface type for Zig 0.15
-const StdoutWriter = *std.Io.Writer;
-
 fn calculateChecksum(data: []const u8) u16 {
     var sum: u32 = 0;
     var i: usize = 0;
@@ -316,46 +244,6 @@ fn calculateChecksum(data: []const u8) u16 {
     }
 
     return ~@as(u16, @truncate(sum));
-}
-
-fn ipToU32(ip: [4]u8) u32 {
-    return @as(u32, ip[0]) << 24 | @as(u32, ip[1]) << 16 | @as(u32, ip[2]) << 8 | @as(u32, ip[3]);
-}
-
-fn u32ToIp(val: u32) [4]u8 {
-    return .{
-        @truncate(val >> 24),
-        @truncate(val >> 16),
-        @truncate(val >> 8),
-        @truncate(val),
-    };
-}
-
-// Monotonic clock in µs: immune to NTP steps and slews of the wall clock.
-// Used for all pacing/timeouts and as the step-safe RTT measurement; the
-// wall clock is only consulted to compare against kernel receive stamps.
-fn clockMicros(clk: c.clockid_t) i64 {
-    var ts: c.timespec = undefined;
-    if (c.clock_gettime(clk, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.us_per_s + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_us);
-}
-
-fn monotonicMicros() i64 {
-    return clockMicros(.MONOTONIC);
-}
-
-// Wall clock in µs since the Unix epoch, the same clock domain as the
-// kernel's SO_TIMESTAMP receive stamps.
-fn wallMicros() i64 {
-    return clockMicros(.REALTIME);
-}
-
-fn sleepNanos(ns: u64) void {
-    var req: c.timespec = .{
-        .sec = @intCast(ns / std.time.ns_per_s),
-        .nsec = @intCast(ns % std.time.ns_per_s),
-    };
-    _ = c.nanosleep(&req, null);
 }
 
 // State shared between the sender thread and the main (receiver) thread.
@@ -437,14 +325,17 @@ const Scanner = struct {
     is_raw_socket: bool,
     magic: [4]u8,
     kernel_ts_enabled: bool,
+    generation: u8 = 0,
 
     // Payload tag written into every echo request and checked on every reply,
     // so replies to other processes' pings (a raw ICMP socket sees them all)
     // and stale replies from a previous phase are ignored. The phase byte
-    // distinguishes discovery packets from latency packets.
+    // distinguishes discovery packets from latency packets; the generation
+    // byte (bumped per discover) separates repeated scans in mesh mode.
     fn phaseMagic(self: *const Scanner, phase: u8) [4]u8 {
         var m = self.magic;
         m[3] ^= phase;
+        m[2] ^= self.generation;
         return m;
     }
 
@@ -539,6 +430,7 @@ const Scanner = struct {
 
     // Phase 1: Discovery - sender thread + receiver in main thread
     pub fn discover(self: *Scanner, stdout: StdoutWriter) !std.ArrayList([4]u8) {
+        self.generation +%= 1;
         const magic = self.phaseMagic(1);
         var state = ScanState{
             .sent_count = std.atomic.Value(usize).init(0),
@@ -890,45 +782,6 @@ const Scanner = struct {
     }
 };
 
-fn ipToString(ip: [4]u8, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{}.{}.{}.{}", .{ ip[0], ip[1], ip[2], ip[3] }) catch "";
-}
-
-fn latencyToColor(latency_us: ?u64) []const u8 {
-    if (latency_us == null) return "\x1b[90m"; // Gray - offline
-
-    const lat = latency_us.?;
-    if (lat < 1000) return "\x1b[92m"; // Bright green - excellent (<1ms)
-    if (lat < 5000) return "\x1b[32m"; // Green - good (<5ms)
-    if (lat < 20000) return "\x1b[93m"; // Yellow - okay (<20ms)
-    if (lat < 100000) return "\x1b[33m"; // Orange - slow (<100ms)
-    return "\x1b[91m"; // Red - very slow
-}
-
-fn latencyToBlock(latency_us: ?u64) []const u8 {
-    if (latency_us == null) return "·";
-
-    const lat = latency_us.?;
-    if (lat < 1000) return "█";
-    if (lat < 5000) return "▓";
-    if (lat < 20000) return "▒";
-    if (lat < 100000) return "░";
-    return "▪";
-}
-
-fn formatLatency(latency_us: ?u64, buf: []u8) []const u8 {
-    if (latency_us == null) return "---";
-
-    const lat = latency_us.?;
-    if (lat < 1000) {
-        return std.fmt.bufPrint(buf, "{d}µs", .{lat}) catch "???";
-    } else if (lat < 1000000) {
-        return std.fmt.bufPrint(buf, "{d:.1}ms", .{@as(f64, @floatFromInt(lat)) / 1000.0}) catch "???";
-    } else {
-        return std.fmt.bufPrint(buf, "{d:.1}s", .{@as(f64, @floatFromInt(lat)) / 1000000.0}) catch "???";
-    }
-}
-
 fn generateIpRange(allocator: std.mem.Allocator, subnet: [4]u8, mask_bits: u8) ![]const [4]u8 {
     const host_bits: u5 = @intCast(32 - mask_bits);
     const total: u32 = @as(u32, 1) << host_bits;
@@ -945,41 +798,6 @@ fn generateIpRange(allocator: std.mem.Allocator, subnet: [4]u8, mask_bits: u8) !
     }
 
     return ips;
-}
-
-fn displayWidth(s: []const u8) usize {
-    // Count display width, accounting for multi-byte UTF-8 and ANSI escape sequences
-    var width: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) {
-        const byte = s[i];
-        // Skip ANSI escape sequences (e.g., \x1b[32m)
-        if (byte == 0x1b and i + 1 < s.len and s[i + 1] == '[') {
-            i += 2;
-            // Skip until we hit the final byte of the sequence (letter)
-            while (i < s.len and (s[i] < 0x40 or s[i] > 0x7E)) : (i += 1) {}
-            if (i < s.len) i += 1; // Skip the final letter
-            continue;
-        }
-        if (byte < 0x80) {
-            // ASCII
-            width += 1;
-            i += 1;
-        } else if (byte < 0xE0) {
-            // 2-byte UTF-8 (includes µ)
-            width += 1;
-            i += 2;
-        } else if (byte < 0xF0) {
-            // 3-byte UTF-8
-            width += 1;
-            i += 3;
-        } else {
-            // 4-byte UTF-8
-            width += 1;
-            i += 4;
-        }
-    }
-    return width;
 }
 
 fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: usize) void {
@@ -1156,6 +974,57 @@ fn parseSubnet(arg: []const u8) ?struct { subnet: [4]u8, mask: u8 } {
     return .{ .subnet = u32ToIp(base), .mask = mask };
 }
 
+// Run one full discovery + latency scan. Returns owned results sorted by IP;
+// empty (not an error) when nothing responded, so mesh mode can keep going.
+fn runScanOnce(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWriter) ![]PingResult {
+    var alive_hosts = try scanner.discover(stdout);
+    defer alive_hosts.deinit(allocator);
+
+    std.mem.sort([4]u8, alive_hosts.items, {}, struct {
+        fn lessThan(_: void, a: [4]u8, b: [4]u8) bool {
+            return ipToU32(a) < ipToU32(b);
+        }
+    }.lessThan);
+
+    const results = try allocator.alloc(PingResult, alive_hosts.items.len);
+    errdefer allocator.free(results);
+    if (results.len > 0) {
+        stdout.print("\n", .{}) catch {};
+        try scanner.measureLatency(alive_hosts.items, results, stdout);
+    }
+    return results;
+}
+
+// Mesh mode: scan, share results with peers over UDP, render the combined
+// latency matrix, and rescan on an interval. Runs until interrupted.
+fn runMeshMode(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWriter, config: Config) !void {
+    var mesh = mesh_mod.Mesh.init(allocator, config.mesh_port, config.subnet, config.mask_bits) catch |err| {
+        std.debug.print("Error: failed to open mesh UDP socket on port {d}: {s}\n", .{ config.mesh_port, @errorName(err) });
+        return err;
+    };
+    defer mesh.deinit();
+
+    const rescan_us: i64 = @as(i64, config.rescan_interval_s) * std.time.us_per_s;
+    var next_scan_at: i64 = monotonicMicros(); // first scan runs immediately
+
+    while (true) {
+        const now = monotonicMicros();
+        if (next_scan_at <= now) {
+            const results = try runScanOnce(scanner, allocator, stdout);
+            defer allocator.free(results);
+            try mesh.setLocalResults(results);
+            next_scan_at = if (rescan_us > 0)
+                monotonicMicros() + rescan_us
+            else
+                std.math.maxInt(i64);
+        }
+        mesh.pump();
+        mesh.renderIfDue(stdout, if (rescan_us > 0) next_scan_at else null);
+        // Sleep until mesh traffic arrives or a short tick elapses
+        _ = mesh.poller.wait(100);
+    }
+}
+
 fn nextArgValue(args: []const [:0]const u8, i: *usize) []const u8 {
     if (i.* + 1 >= args.len) {
         std.debug.print("Error: {s} requires a value (see --help)\n", .{args[i.*]});
@@ -1206,6 +1075,12 @@ pub fn main(init: std.process.Init) !void {
                 \\  -d <ms>     Discovery timeout in milliseconds (default: 1000)
                 \\  -p <count>  Number of pings per host for latency (default: 5, max 16)
                 \\  -t <ms>     Timeout per ping in latency phase (default: 1000)
+                \\  --mesh      Mesh mode: discover other instances of this tool on the
+                \\              LAN over UDP, share results, and render a live matrix of
+                \\              every host's latency from every vantage point
+                \\  --mesh-port <port>  UDP port for mesh discovery/gossip (default: 47269)
+                \\  -i <sec>    Mesh mode: rescan interval in seconds, 0 = scan once
+                \\              (default: 60)
                 \\  -h, --help  Show this help
                 \\
                 \\The subnet is auto-detected from your network interface if not specified.
@@ -1213,6 +1088,8 @@ pub fn main(init: std.process.Init) !void {
                 \\How it works:
                 \\  Phase 1: Blasts pings to all IPs, waits for discovery timeout
                 \\  Phase 2: Measures latency only on hosts that responded
+                \\  Mesh:    Peers announce themselves via UDP broadcast beacons and
+                \\           gossip scan results; each node renders the combined matrix
                 \\
                 \\Note: Requires root/sudo for raw ICMP sockets on most systems.
                 \\
@@ -1235,6 +1112,17 @@ pub fn main(init: std.process.Init) !void {
             const value = nextArgValue(args, &i);
             config.latency_timeout_ms = std.fmt.parseInt(u32, value, 10) catch
                 return invalidArgValue("-t", value);
+        } else if (std.mem.eql(u8, arg, "--mesh")) {
+            config.mesh = true;
+        } else if (std.mem.eql(u8, arg, "--mesh-port")) {
+            const value = nextArgValue(args, &i);
+            config.mesh_port = std.fmt.parseInt(u16, value, 10) catch
+                return invalidArgValue("--mesh-port", value);
+            if (config.mesh_port == 0) return invalidArgValue("--mesh-port", value);
+        } else if (std.mem.eql(u8, arg, "-i")) {
+            const value = nextArgValue(args, &i);
+            config.rescan_interval_s = std.fmt.parseInt(u32, value, 10) catch
+                return invalidArgValue("-i", value);
         } else if (!subnet_set) {
             const parsed = parseSubnet(arg) orelse {
                 std.debug.print("Error: unrecognized argument '{s}' (see --help)\n", .{arg});
@@ -1285,33 +1173,28 @@ pub fn main(init: std.process.Init) !void {
     };
     defer scanner.deinit();
 
-    stdout.print("  Receive timestamps: {s}\n\n", .{
+    stdout.print("  Receive timestamps: {s}\n", .{
         if (scanner.kernel_ts_enabled) "kernel (SO_TIMESTAMP)" else "userspace (kernel timestamps unavailable)",
     }) catch {};
 
-    // Phase 1: Discovery
-    var alive_hosts = try scanner.discover(stdout);
-    defer alive_hosts.deinit(allocator);
+    if (config.mesh) {
+        stdout.print("  Mesh: UDP port {d}, rescan interval {d}s{s}\n\n", .{
+            config.mesh_port,
+            config.rescan_interval_s,
+            if (config.rescan_interval_s == 0) " (scan once)" else "",
+        }) catch {};
+        return runMeshMode(&scanner, allocator, stdout, config);
+    }
+    stdout.print("\n", .{}) catch {};
 
-    if (alive_hosts.items.len == 0) {
+    const results = try runScanOnce(&scanner, allocator, stdout);
+    defer allocator.free(results);
+
+    if (results.len == 0) {
         stdout.print("\n\x1b[93mNo devices responded. Are you on the right subnet?\x1b[0m\n", .{}) catch {};
         stdout.print("Try running with sudo if you haven't already.\n", .{}) catch {};
         return;
     }
-
-    // Sort discovered hosts by IP
-    std.mem.sort([4]u8, alive_hosts.items, {}, struct {
-        fn lessThan(_: void, a: [4]u8, b: [4]u8) bool {
-            return ipToU32(a) < ipToU32(b);
-        }
-    }.lessThan);
-
-    // Phase 2: Latency measurement
-    const results = try allocator.alloc(PingResult, alive_hosts.items.len);
-    defer allocator.free(results);
-
-    stdout.print("\n", .{}) catch {};
-    try scanner.measureLatency(alive_hosts.items, results, stdout);
 
     printLegend(stdout);
 
@@ -1322,6 +1205,11 @@ pub fn main(init: std.process.Init) !void {
 }
 
 const testing = std.testing;
+
+test {
+    _ = @import("common.zig");
+    _ = @import("mesh.zig");
+}
 
 test "calculateChecksum verifies to zero over a packet containing its own checksum" {
     var packet: [16]u8 align(4) = undefined;
@@ -1335,12 +1223,6 @@ test "calculateChecksum verifies to zero over a packet containing its own checks
 
     header.checksum = calculateChecksum(&packet);
     try testing.expectEqual(@as(u16, 0), calculateChecksum(&packet));
-}
-
-test "ipToU32 and u32ToIp round-trip" {
-    const ip = [4]u8{ 192, 168, 1, 42 };
-    try testing.expectEqual(@as(u32, 0xC0A8012A), ipToU32(ip));
-    try testing.expectEqual(ip, u32ToIp(ipToU32(ip)));
 }
 
 test "parseSubnet masks host bits" {
@@ -1381,19 +1263,6 @@ test "generateIpRange handles /31 and /32 without underflow" {
     try testing.expectEqual(@as(usize, 2), two.len);
     try testing.expectEqual([4]u8{ 10, 0, 0, 4 }, two[0]);
     try testing.expectEqual([4]u8{ 10, 0, 0, 5 }, two[1]);
-}
-
-test "displayWidth ignores ANSI escapes and counts multi-byte chars once" {
-    try testing.expectEqual(@as(usize, 3), displayWidth("abc"));
-    try testing.expectEqual(@as(usize, 5), displayWidth("\x1b[92m1.2ms\x1b[0m"));
-    try testing.expectEqual(@as(usize, 5), displayWidth("123µs"));
-}
-
-test "monotonicMicros is nondecreasing" {
-    const a = monotonicMicros();
-    const b = monotonicMicros();
-    try testing.expect(b >= a);
-    try testing.expect(a > 0);
 }
 
 test "kernel_ts.parse extracts SCM_TIMESTAMP, skipping unrelated cmsgs" {

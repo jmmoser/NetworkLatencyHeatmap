@@ -7,5 +7,7 @@
         "build.zig",
         "build.zig.zon",
         "main.zig",
+        "common.zig",
+        "mesh.zig",
     },
 }
