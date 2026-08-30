@@ -480,6 +480,7 @@ pub const Mesh = struct {
     last_beacon_us: i64,
     last_gossip_us: i64,
     last_render_us: i64,
+    last_countdown_s: i64, // rescan countdown shown by the last render, -1 = none
     dirty: bool,
 
     pub fn init(allocator: std.mem.Allocator, port: u16, subnet: [4]u8, mask_bits: u8, tcp_targets: []const probe.TcpTarget) !Mesh {
@@ -592,6 +593,7 @@ pub const Mesh = struct {
             .last_beacon_us = 0,
             .last_gossip_us = 0,
             .last_render_us = 0,
+            .last_countdown_s = -1,
             .dirty = false,
         };
     }
@@ -1046,8 +1048,20 @@ pub const Mesh = struct {
 
     pub fn renderIfDue(self: *Mesh, stdout: StdoutWriter, next_scan_at: ?i64) void {
         const now = monotonicMicros();
-        if (!self.dirty or now - self.last_render_us < render_min_interval_us) return;
+        if (now - self.last_render_us < render_min_interval_us) return;
+        const countdown_s: i64 = if (next_scan_at) |at|
+            @max(0, @divFloor(at - now, std.time.us_per_s))
+        else
+            -1;
+        // On a TTY the view is redrawn in place, so tick the countdown even
+        // when no data changed; piped output stays data-driven — each render
+        // there is an appended snapshot, not an overwrite.
+        if (!self.dirty) {
+            if (!common.stdout_is_tty) return;
+            if (countdown_s == self.last_countdown_s) return;
+        }
         self.last_render_us = now;
+        self.last_countdown_s = countdown_s;
         self.dirty = false;
         self.render(stdout, now, next_scan_at);
     }

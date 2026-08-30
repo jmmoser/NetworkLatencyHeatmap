@@ -967,7 +967,29 @@ const Scanner = struct {
     }
 };
 
-fn generateIpRange(allocator: std.mem.Allocator, subnet: [4]u8, mask_bits: u8) ![]const [4]u8 {
+// Pinging one of our own addresses never leaves the machine — the local
+// stack answers directly — so it measures nothing about the network. Compact
+// the scan list to drop any IP that belongs to a local interface, returning
+// the kept length.
+fn removeLocalAddrs(ips: [][4]u8) usize {
+    var entries: [max_ifaces]IfaceEntry = undefined;
+    const n = collectIfaces(&entries);
+    if (n == 0) return ips.len;
+    var kept: usize = 0;
+    for (ips) |ip| {
+        const addr_be: u32 = @bitCast(ip);
+        const is_local = for (entries[0..n]) |*e| {
+            if (e.addr_be == addr_be) break true;
+        } else false;
+        if (!is_local) {
+            ips[kept] = ip;
+            kept += 1;
+        }
+    }
+    return kept;
+}
+
+fn generateIpRange(allocator: std.mem.Allocator, subnet: [4]u8, mask_bits: u8) ![][4]u8 {
     const host_bits: u5 = @intCast(32 - mask_bits);
     const total: u32 = @as(u32, 1) << host_bits;
     // /31 (RFC 3021) and /32 have no network/broadcast addresses to exclude
@@ -1419,10 +1441,18 @@ pub fn main(init: std.process.Init) !void {
         config.latency_timeout_ms,
     }) catch {};
 
-    const all_ips = try generateIpRange(allocator, config.subnet, config.mask_bits);
-    defer allocator.free(all_ips);
+    const full_range = try generateIpRange(allocator, config.subnet, config.mask_bits);
+    defer allocator.free(full_range);
+    const all_ips = full_range[0..removeLocalAddrs(full_range)];
 
-    stdout.print("  Total IPs to scan: {d}\n", .{all_ips.len}) catch {};
+    stdout.print("  Total IPs to scan: {d}", .{all_ips.len}) catch {};
+    if (all_ips.len < full_range.len) {
+        stdout.print(" (excluding {d} own address{s})", .{
+            full_range.len - all_ips.len,
+            if (full_range.len - all_ips.len == 1) "" else "es",
+        }) catch {};
+    }
+    stdout.print("\n", .{}) catch {};
 
     // Two-phase scanner
     var scanner = Scanner.init(allocator, all_ips, config) catch |err| {
