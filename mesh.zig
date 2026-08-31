@@ -5,7 +5,8 @@
 // Protocol (UDP, all multi-byte integers little-endian):
 //
 //   Header (all messages, 13 bytes):
-//     [0..4)   magic "NLH1" (protocol version baked into the magic)
+//     [0..4)   magic "NLH2" (protocol version baked into the magic; "NLS2"
+//              when the mesh runs with --mesh-key, see below)
 //     [4]      message type: 1 = beacon, 2 = results chunk
 //     [5..13)  node id (random u64, identifies a scanner instance)
 //
@@ -20,8 +21,9 @@
 //     [17..19) total entries in this result set
 //     [19..21) offset of this chunk's first entry
 //     [21..23) entry count in this chunk
-//     [23..)   entries, 16 bytes each:
-//                ip [4]u8 (network order), min/avg/max u32 µs
+//     [23..)   entries, 21 bytes each:
+//                ip [4]u8 (network order), min/avg/max/jitter u32 µs,
+//                packet loss u8 (percent)
 //                (0xFFFFFFFF = host discovered but no latency sample)
 //
 //   Ping / pong (types 3 / 4, unicast, measure node↔node UDP RTT):
@@ -66,7 +68,7 @@ const StdoutWriter = common.StdoutWriter;
 
 pub const default_port: u16 = 47269;
 
-const protocol_magic = [4]u8{ 'N', 'L', 'H', '1' };
+const protocol_magic = [4]u8{ 'N', 'L', 'H', '2' };
 const header_len = 13;
 const beacon_fixed_len = header_len + 7; // + seq, host_count, hostname_len
 const results_fixed_len = header_len + 10; // + seq, total, offset, count
@@ -74,9 +76,9 @@ const ping_len = header_len + 8; // + token
 const links_fixed_len = header_len + 2; // + peer link count, target count
 const link_entry_len = 17; // node id, udp avg, tcp avg, flags
 const target_entry_len = 11; // ip, port, tcp avg, flags
-const entry_len = 16;
+const entry_len = 21; // ip, min/avg/max/jitter, loss
 const max_hostname = 32;
-const entries_per_chunk = 80; // 80*16 + 23 = 1303 bytes, under typical MTU
+const entries_per_chunk = 60; // 60*21 + 23 = 1283 bytes, under typical MTU
 const recv_buf_len = 2048;
 
 pub const max_peers = 32;
@@ -106,6 +108,8 @@ pub const HostStats = struct {
     min_us: u32,
     avg_us: u32,
     max_us: u32,
+    jitter_us: u32 = no_data,
+    loss_pct: u8 = 0,
 
     pub fn hasData(self: HostStats) bool {
         return self.avg_us != no_data;
@@ -204,6 +208,8 @@ pub fn encodeResultsChunk(buf: []u8, node_id: u64, seq: u32, total: u16, offset:
         std.mem.writeInt(u32, buf[off + 4 ..][0..4], e.stats.min_us, .little);
         std.mem.writeInt(u32, buf[off + 8 ..][0..4], e.stats.avg_us, .little);
         std.mem.writeInt(u32, buf[off + 12 ..][0..4], e.stats.max_us, .little);
+        std.mem.writeInt(u32, buf[off + 16 ..][0..4], e.stats.jitter_us, .little);
+        buf[off + 20] = e.stats.loss_pct;
         off += entry_len;
     }
     return buf[0..off];
@@ -273,6 +279,8 @@ pub fn decodeEntry(bytes: []const u8) Entry {
             .min_us = std.mem.readInt(u32, bytes[4..8], .little),
             .avg_us = std.mem.readInt(u32, bytes[8..12], .little),
             .max_us = std.mem.readInt(u32, bytes[12..16], .little),
+            .jitter_us = std.mem.readInt(u32, bytes[16..20], .little),
+            .loss_pct = @min(bytes[20], 100),
         },
     };
 }
@@ -344,6 +352,11 @@ pub fn parseMessage(buf: []const u8) ?Parsed {
 pub fn spreadIsUneven(min_avg: u64, max_avg: u64) bool {
     return max_avg >= min_avg * 3 and (max_avg - min_avg) > 2000;
 }
+
+// Probe loss at or above this is flagged in the matrix and the insights:
+// with 5 probes per round, 20% is one dropped probe — anything recurring
+// at that level is a real symptom, not sampling noise.
+pub const loss_flag_pct: u8 = 20;
 
 fn medianOfSorted(sorted: []const u64) ?u64 {
     if (sorted.len == 0) return null;
@@ -708,6 +721,8 @@ pub const Mesh = struct {
                 .min_us = clampStat(r.latency_us),
                 .avg_us = clampStat(r.latency_avg),
                 .max_us = clampStat(r.latency_max),
+                .jitter_us = clampStat(r.jitter_us),
+                .loss_pct = r.lossPct(),
             };
             const ip = ipToU32(r.ip);
             try self.local_hosts.put(ip, stats);
@@ -1183,6 +1198,7 @@ pub const Mesh = struct {
         // Matrix body
         const shown_rows = @min(rows.items.len, max_display_rows);
         var uneven_count: usize = 0;
+        var lossy_count: usize = 0;
         for (rows.items[0..shown_rows]) |ip| {
             var ip_buf: [16]u8 = undefined;
             const ip_str = ipToString(u32ToIp(ip), &ip_buf);
@@ -1191,6 +1207,7 @@ pub const Mesh = struct {
             var row_min: u64 = std.math.maxInt(u64);
             var row_max: u64 = 0;
             var row_samples: usize = 0;
+            var row_lossy = false;
             for (observers[0..shown_obs]) |*o| {
                 const stats = o.hosts.get(ip);
                 const avg: ?u64 = if (stats) |s| s.avg() else null;
@@ -1199,14 +1216,21 @@ pub const Mesh = struct {
                     row_max = @max(row_max, a);
                     row_samples += 1;
                 }
+                const lossy = if (stats) |s| s.loss_pct >= loss_flag_pct else false;
+                if (lossy) row_lossy = true;
                 var lat_buf: [16]u8 = undefined;
                 const lat_str = formatLatency(avg, &lat_buf);
                 const color = latencyToColor(avg);
                 const block = latencyToBlock(avg);
-                stdout.print("{s}{s} {s}{s}", .{ color, block, lat_str, reset }) catch {};
-                const used = 2 + displayWidth(lat_str);
+                const loss_mark = if (lossy) "!" else "";
+                stdout.print("{s}{s} {s}{s}{s}{s}{s}", .{
+                    color,                     block, lat_str, reset,
+                    common.sgr("\x1b[91m"), loss_mark, reset,
+                }) catch {};
+                const used = 2 + displayWidth(lat_str) + loss_mark.len;
                 stdout.print("{s}", .{pad[0..@max(1, col_width - @min(used, col_width - 1))]}) catch {};
             }
+            if (row_lossy) lossy_count += 1;
             if (row_samples >= 2 and spreadIsUneven(row_min, row_max)) {
                 uneven_count += 1;
                 stdout.print("{s}◀ uneven{s}", .{ yellow, reset }) catch {};
@@ -1217,10 +1241,13 @@ pub const Mesh = struct {
             stdout.print("  {s}... +{d} more targets{s}\n", .{ gray, rows.items.len - shown_rows, reset }) catch {};
         }
 
-        stdout.print("\n  {s}avg latency as seen from each observer · {s}◀ uneven{s}{s} = slowest vantage ≥3x fastest{s}\n", .{ gray, yellow, reset, gray, reset }) catch {};
+        stdout.print("\n  {s}avg latency as seen from each observer · {s}◀ uneven{s}{s} = slowest vantage ≥3x fastest · {s}!{s}{s} = ≥{d}% probe loss{s}\n", .{
+            gray,  yellow,                  reset, gray, common.sgr("\x1b[91m"), reset, gray,
+            loss_flag_pct, reset,
+        }) catch {};
 
         self.renderLinks(stdout, observers[0..num_obs], shown_obs);
-        self.renderInsights(stdout, observers[0..num_obs], rows.items, uneven_count);
+        self.renderInsights(stdout, observers[0..num_obs], rows.items, uneven_count, lossy_count);
     }
 
     const Link = struct { udp: ?u64, tcp: ?u64, refused: bool };
@@ -1415,7 +1442,7 @@ pub const Mesh = struct {
 
     // Column-level analysis: an observer whose median latency to everything
     // is far above the mesh-wide median is itself poorly connected
-    fn renderInsights(self: *Mesh, stdout: StdoutWriter, observers: []const Observer, rows: []const u32, uneven_count: usize) void {
+    fn renderInsights(self: *Mesh, stdout: StdoutWriter, observers: []const Observer, rows: []const u32, uneven_count: usize, lossy_count: usize) void {
         const reset = common.sgr("\x1b[0m");
         const yellow = common.sgr("\x1b[93m");
         var all_avgs: std.ArrayList(u64) = .empty;
@@ -1465,6 +1492,17 @@ pub const Mesh = struct {
                 if (uneven_count == 1) "" else "s",
             }) catch {};
         }
+        if (lossy_count > 0) {
+            if (!printed_header) {
+                stdout.print("\n  {s}⚠ Insights:{s}\n", .{ yellow, reset }) catch {};
+                printed_header = true;
+            }
+            stdout.print("    {d} target{s} dropping ≥{d}% of probes — a host can average fast while losing packets (radio interference, power saving, overload)\n", .{
+                lossy_count,
+                if (lossy_count == 1) "" else "s",
+                loss_flag_pct,
+            }) catch {};
+        }
     }
 };
 
@@ -1490,8 +1528,8 @@ test "beacon encode truncates an oversized hostname" {
 
 test "results chunk round-trips including the no-data sentinel" {
     const entries = [_]Entry{
-        .{ .ip = ipToU32(.{ 192, 168, 1, 1 }), .stats = .{ .min_us = 100, .avg_us = 250, .max_us = 900 } },
-        .{ .ip = ipToU32(.{ 192, 168, 1, 7 }), .stats = .{ .min_us = no_data, .avg_us = no_data, .max_us = no_data } },
+        .{ .ip = ipToU32(.{ 192, 168, 1, 1 }), .stats = .{ .min_us = 100, .avg_us = 250, .max_us = 900, .jitter_us = 42, .loss_pct = 20 } },
+        .{ .ip = ipToU32(.{ 192, 168, 1, 7 }), .stats = .{ .min_us = no_data, .avg_us = no_data, .max_us = no_data, .jitter_us = no_data, .loss_pct = 100 } },
     };
     var buf: [results_fixed_len + entries_per_chunk * entry_len]u8 = undefined;
     const msg = encodeResultsChunk(&buf, 99, 3, 10, 4, &entries);
@@ -1505,11 +1543,20 @@ test "results chunk round-trips including the no-data sentinel" {
     const e0 = decodeEntry(parsed.results.entries[0..entry_len]);
     try testing.expectEqual(entries[0].ip, e0.ip);
     try testing.expectEqual(@as(u32, 250), e0.stats.avg_us);
+    try testing.expectEqual(@as(u32, 42), e0.stats.jitter_us);
+    try testing.expectEqual(@as(u8, 20), e0.stats.loss_pct);
     try testing.expect(e0.stats.hasData());
 
     const e1 = decodeEntry(parsed.results.entries[entry_len .. 2 * entry_len]);
     try testing.expectEqual(entries[1].ip, e1.ip);
+    try testing.expectEqual(@as(u8, 100), e1.stats.loss_pct);
     try testing.expect(!e1.stats.hasData());
+}
+
+test "decodeEntry clamps a loss percentage over 100" {
+    var bytes: [entry_len]u8 = @splat(0);
+    bytes[20] = 250; // forged loss byte
+    try testing.expectEqual(@as(u8, 100), decodeEntry(&bytes).stats.loss_pct);
 }
 
 test "ping and pong round-trip through encode and parse" {
@@ -1590,9 +1637,9 @@ test "parseMessage rejects malformed datagrams" {
     // Too short for any header
     try testing.expect(parseMessage(&.{ 'N', 'L', 'H' }) == null);
 
-    // Wrong magic/version
+    // Wrong magic/version (NLH1 is the previous protocol version)
     var bad_magic: [beacon_fixed_len]u8 = @splat(0);
-    @memcpy(bad_magic[0..4], "NLH2");
+    @memcpy(bad_magic[0..4], "NLH1");
     bad_magic[4] = 1;
     try testing.expect(parseMessage(&bad_magic) == null);
 

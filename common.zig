@@ -51,6 +51,17 @@ pub const PingResult = struct {
     latency_us: ?u64, // microseconds, null if timeout (min latency)
     latency_avg: ?u64, // average latency
     latency_max: ?u64, // max latency
+    jitter_us: ?u64 = null, // standard deviation of the samples (ping's mdev)
+    sent: u8 = 0, // probes sent to this host in the latency phase
+    received: u8 = 0, // probes answered
+
+    // Packet loss in percent. A host that answered discovery but none of
+    // the latency probes reads as 100%, which is exactly the signal.
+    pub fn lossPct(self: *const PingResult) u8 {
+        if (self.sent == 0) return 0;
+        const lost: u32 = self.sent - @min(self.received, self.sent);
+        return @intCast(lost * 100 / self.sent);
+    }
 };
 
 // Platform-agnostic event poller for socket readiness

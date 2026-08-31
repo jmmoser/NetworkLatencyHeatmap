@@ -362,6 +362,25 @@ const LatencyData = struct {
         }
         return total / self.count;
     }
+
+    // Standard deviation of the samples (what ping calls mdev). High jitter
+    // with a low average is its own symptom — a link can look fast on
+    // average while being unusable for anything interactive.
+    fn getJitter(self: *const LatencyData) ?u64 {
+        if (self.count == 0) return null;
+        if (self.count == 1) return 0;
+        const n: f64 = @floatFromInt(self.count);
+        var mean: f64 = 0;
+        for (self.samples[0..self.count]) |s| mean += @floatFromInt(s);
+        mean /= n;
+        var variance: f64 = 0;
+        for (self.samples[0..self.count]) |s| {
+            const d = @as(f64, @floatFromInt(s)) - mean;
+            variance += d * d;
+        }
+        variance /= n;
+        return @intFromFloat(@sqrt(variance));
+    }
 };
 
 fn calculateChecksum(data: []const u8) u16 {
@@ -963,6 +982,9 @@ const Scanner = struct {
             results[i].latency_us = latencies[i].getMin();
             results[i].latency_avg = latencies[i].getAvg();
             results[i].latency_max = latencies[i].getMax();
+            results[i].jitter_us = latencies[i].getJitter();
+            results[i].sent = num_rounds;
+            results[i].received = latencies[i].count;
         }
     }
 };
@@ -1050,9 +1072,21 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
                 }) catch "???";
             } else "---";
 
-            stdout.print("{s}{s}{s} {s}", .{ block_color, block, reset, combined_str }) catch {};
+            // Flag packet loss right in the cell — an average computed only
+            // from the probes that survived understates a lossy link
+            var loss_buf: [8]u8 = undefined;
+            const loss = r.lossPct();
+            const loss_str = if (loss > 0)
+                std.fmt.bufPrint(&loss_buf, " !{d}%", .{loss}) catch ""
+            else
+                "";
+
+            stdout.print("{s}{s}{s} {s}{s}{s}{s}", .{
+                block_color,               block, reset, combined_str,
+                common.sgr("\x1b[91m"), loss_str, reset,
+            }) catch {};
             // 2 display chars for "█ ", rest is latency string (use display width for proper alignment)
-            const used = 2 + displayWidth(combined_str);
+            const used = 2 + displayWidth(combined_str) + loss_str.len;
             const pad = if (used < col_width) col_width - used else 1; // At least one space between columns
             stdout.print("{s}", .{spaces[0..pad]}) catch {};
         }
@@ -1067,8 +1101,12 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
     var total_avg_latency: u64 = 0;
     var best_avg: u64 = std.math.maxInt(u64);
     var worst_avg: u64 = 0;
+    var total_jitter: u64 = 0;
+    var worst_jitter: u64 = 0;
     var slow_devices: [10]PingResult = undefined;
     var slow_count: usize = 0;
+    var lossy_devices: [10]PingResult = undefined;
+    var lossy_count: usize = 0;
 
     for (results) |r| {
         if (r.latency_avg) |avg_lat| {
@@ -1076,6 +1114,10 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
             total_avg_latency += avg_lat;
             if (avg_lat < best_avg) best_avg = avg_lat;
             if (avg_lat > worst_avg) worst_avg = avg_lat;
+            if (r.jitter_us) |j| {
+                total_jitter += j;
+                if (j > worst_jitter) worst_jitter = j;
+            }
 
             // Track slow devices (avg >20ms)
             if (avg_lat > 20000) {
@@ -1084,6 +1126,12 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
                     slow_count += 1;
                 }
             }
+        }
+        // A host that answered discovery but dropped latency probes is
+        // lossy even when the surviving samples look fine
+        if (r.lossPct() > 0 and lossy_count < 10) {
+            lossy_devices[lossy_count] = r;
+            lossy_count += 1;
         }
     }
 
@@ -1108,6 +1156,12 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
         stdout.print("    Best:  {s}\n", .{formatLatency(best_avg, &buf1)}) catch {};
         stdout.print("    Mean:  {s}\n", .{formatLatency(total_avg_latency / alive_count, &buf2)}) catch {};
         stdout.print("    Worst: {s}\n", .{formatLatency(worst_avg, &buf3)}) catch {};
+
+        var jbuf1: [16]u8 = undefined;
+        var jbuf2: [16]u8 = undefined;
+        stdout.print("  Jitter (mdev):\n", .{}) catch {};
+        stdout.print("    Mean:  {s}\n", .{formatLatency(total_jitter / alive_count, &jbuf1)}) catch {};
+        stdout.print("    Worst: {s}\n", .{formatLatency(worst_jitter, &jbuf2)}) catch {};
     }
 
     if (slow_count > 0) {
@@ -1118,6 +1172,19 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
             stdout.print("    {s}: {s} avg\n", .{
                 ipToString(r.ip, &ip_buf),
                 formatLatency(r.latency_avg, &lat_buf),
+            }) catch {};
+        }
+    }
+
+    if (lossy_count > 0) {
+        stdout.print("\n  {s}⚠ Lossy devices (dropped probes):{s}\n", .{ common.sgr("\x1b[91m"), reset }) catch {};
+        for (lossy_devices[0..lossy_count]) |*r| {
+            var ip_buf: [16]u8 = undefined;
+            stdout.print("    {s}: {d}% loss ({d}/{d} answered)\n", .{
+                ipToString(r.ip, &ip_buf),
+                r.lossPct(),
+                r.received,
+                r.sent,
             }) catch {};
         }
     }
@@ -1629,4 +1696,31 @@ test "LatencyData caps samples and computes min/avg/max" {
 
     for (0..LatencyData.max_samples * 2) |_| data.add(1);
     try testing.expectEqual(@as(u8, LatencyData.max_samples), data.count);
+}
+
+test "LatencyData jitter is stddev of the samples" {
+    var data = LatencyData.init();
+    try testing.expectEqual(@as(?u64, null), data.getJitter());
+
+    data.add(100);
+    try testing.expectEqual(@as(?u64, 0), data.getJitter());
+
+    data.add(300); // mean 200, deviations ±100
+    try testing.expectEqual(@as(?u64, 100), data.getJitter());
+
+    data.add(200); // 100/200/300: variance 20000/3, stddev ~81
+    try testing.expectEqual(@as(?u64, 81), data.getJitter());
+}
+
+test "PingResult lossPct" {
+    var r = PingResult{ .ip = .{ 1, 2, 3, 4 }, .latency_us = null, .latency_avg = null, .latency_max = null };
+    try testing.expectEqual(@as(u8, 0), r.lossPct()); // nothing sent yet
+
+    r.sent = 5;
+    r.received = 5;
+    try testing.expectEqual(@as(u8, 0), r.lossPct());
+    r.received = 4;
+    try testing.expectEqual(@as(u8, 20), r.lossPct());
+    r.received = 0;
+    try testing.expectEqual(@as(u8, 100), r.lossPct());
 }
