@@ -6,6 +6,7 @@ const common = @import("common.zig");
 const mesh_mod = @import("mesh.zig");
 const probe = @import("probe.zig");
 const plat = @import("plat.zig");
+const httpd = @import("httpd.zig");
 
 const SocketPoller = common.SocketPoller;
 const PingResult = common.PingResult;
@@ -307,6 +308,10 @@ const Config = struct {
     mesh: bool = false, // Share results with peers and render the mesh matrix
     mesh_port: u16 = mesh_mod.default_port,
     rescan_interval_s: u32 = 60, // Mesh mode: seconds between scans, 0 = scan once
+    resolve_names: bool = true, // Reverse-DNS discovered hosts (--no-names)
+    json: bool = false, // One-shot scan: emit JSON instead of the heatmap
+    http_port: u16 = 0, // Mesh mode: serve /json + /metrics (0 = off)
+    mesh_key: ?[32]u8 = null, // --mesh-key: authenticate mesh datagrams
 
     // Extra TCP ping targets (--tcp-ping ip:port): hosts that aren't running
     // this tool but answer a SYN on a known port with SYN-ACK or RST
@@ -361,6 +366,25 @@ const LatencyData = struct {
             total += s;
         }
         return total / self.count;
+    }
+
+    // Standard deviation of the samples (what ping calls mdev). High jitter
+    // with a low average is its own symptom — a link can look fast on
+    // average while being unusable for anything interactive.
+    fn getJitter(self: *const LatencyData) ?u64 {
+        if (self.count == 0) return null;
+        if (self.count == 1) return 0;
+        const n: f64 = @floatFromInt(self.count);
+        var mean: f64 = 0;
+        for (self.samples[0..self.count]) |s| mean += @floatFromInt(s);
+        mean /= n;
+        var variance: f64 = 0;
+        for (self.samples[0..self.count]) |s| {
+            const d = @as(f64, @floatFromInt(s)) - mean;
+            variance += d * d;
+        }
+        variance /= n;
+        return @intFromFloat(@sqrt(variance));
     }
 };
 
@@ -963,6 +987,9 @@ const Scanner = struct {
             results[i].latency_us = latencies[i].getMin();
             results[i].latency_avg = latencies[i].getAvg();
             results[i].latency_max = latencies[i].getMax();
+            results[i].jitter_us = latencies[i].getJitter();
+            results[i].sent = num_rounds;
+            results[i].received = latencies[i].count;
         }
     }
 };
@@ -1026,6 +1053,20 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
         }
         stdout.print("\n", .{}) catch {};
 
+        // Reverse-DNS names under the IPs, when any host in this band has one
+        var have_names = false;
+        for (results[row_start..row_end]) |r| {
+            if (r.name_len > 0) have_names = true;
+        }
+        if (have_names) {
+            const gray = common.sgr("\x1b[90m");
+            for (results[row_start..row_end]) |r| {
+                const shown = r.name()[0..@min(r.name().len, col_width - 1)];
+                stdout.print("{s}{s}{s}{s}", .{ gray, shown, reset, spaces[0 .. col_width - shown.len] }) catch {};
+            }
+            stdout.print("\n", .{}) catch {};
+        }
+
         // Print heatmap blocks with min/avg/max latency (each colored independently)
         for (results[row_start..row_end]) |r| {
             const block = latencyToBlock(r.latency_avg);
@@ -1050,9 +1091,21 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
                 }) catch "???";
             } else "---";
 
-            stdout.print("{s}{s}{s} {s}", .{ block_color, block, reset, combined_str }) catch {};
+            // Flag packet loss right in the cell — an average computed only
+            // from the probes that survived understates a lossy link
+            var loss_buf: [8]u8 = undefined;
+            const loss = r.lossPct();
+            const loss_str = if (loss > 0)
+                std.fmt.bufPrint(&loss_buf, " !{d}%", .{loss}) catch ""
+            else
+                "";
+
+            stdout.print("{s}{s}{s} {s}{s}{s}{s}", .{
+                block_color,               block, reset, combined_str,
+                common.sgr("\x1b[91m"), loss_str, reset,
+            }) catch {};
             // 2 display chars for "█ ", rest is latency string (use display width for proper alignment)
-            const used = 2 + displayWidth(combined_str);
+            const used = 2 + displayWidth(combined_str) + loss_str.len;
             const pad = if (used < col_width) col_width - used else 1; // At least one space between columns
             stdout.print("{s}", .{spaces[0..pad]}) catch {};
         }
@@ -1067,8 +1120,12 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
     var total_avg_latency: u64 = 0;
     var best_avg: u64 = std.math.maxInt(u64);
     var worst_avg: u64 = 0;
+    var total_jitter: u64 = 0;
+    var worst_jitter: u64 = 0;
     var slow_devices: [10]PingResult = undefined;
     var slow_count: usize = 0;
+    var lossy_devices: [10]PingResult = undefined;
+    var lossy_count: usize = 0;
 
     for (results) |r| {
         if (r.latency_avg) |avg_lat| {
@@ -1076,6 +1133,10 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
             total_avg_latency += avg_lat;
             if (avg_lat < best_avg) best_avg = avg_lat;
             if (avg_lat > worst_avg) worst_avg = avg_lat;
+            if (r.jitter_us) |j| {
+                total_jitter += j;
+                if (j > worst_jitter) worst_jitter = j;
+            }
 
             // Track slow devices (avg >20ms)
             if (avg_lat > 20000) {
@@ -1084,6 +1145,12 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
                     slow_count += 1;
                 }
             }
+        }
+        // A host that answered discovery but dropped latency probes is
+        // lossy even when the surviving samples look fine
+        if (r.lossPct() > 0 and lossy_count < 10) {
+            lossy_devices[lossy_count] = r;
+            lossy_count += 1;
         }
     }
 
@@ -1108,6 +1175,12 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
         stdout.print("    Best:  {s}\n", .{formatLatency(best_avg, &buf1)}) catch {};
         stdout.print("    Mean:  {s}\n", .{formatLatency(total_avg_latency / alive_count, &buf2)}) catch {};
         stdout.print("    Worst: {s}\n", .{formatLatency(worst_avg, &buf3)}) catch {};
+
+        var jbuf1: [16]u8 = undefined;
+        var jbuf2: [16]u8 = undefined;
+        stdout.print("  Jitter (mdev):\n", .{}) catch {};
+        stdout.print("    Mean:  {s}\n", .{formatLatency(total_jitter / alive_count, &jbuf1)}) catch {};
+        stdout.print("    Worst: {s}\n", .{formatLatency(worst_jitter, &jbuf2)}) catch {};
     }
 
     if (slow_count > 0) {
@@ -1115,14 +1188,77 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
         for (slow_devices[0..slow_count]) |r| {
             var ip_buf: [16]u8 = undefined;
             var lat_buf: [16]u8 = undefined;
-            stdout.print("    {s}: {s} avg\n", .{
+            stdout.print("    {s}{s}{s}{s}: {s} avg\n", .{
                 ipToString(r.ip, &ip_buf),
+                if (r.name_len > 0) " (" else "",
+                r.name(),
+                if (r.name_len > 0) ")" else "",
                 formatLatency(r.latency_avg, &lat_buf),
             }) catch {};
         }
     }
 
+    if (lossy_count > 0) {
+        stdout.print("\n  {s}⚠ Lossy devices (dropped probes):{s}\n", .{ common.sgr("\x1b[91m"), reset }) catch {};
+        for (lossy_devices[0..lossy_count]) |*r| {
+            var ip_buf: [16]u8 = undefined;
+            stdout.print("    {s}{s}{s}{s}: {d}% loss ({d}/{d} answered)\n", .{
+                ipToString(r.ip, &ip_buf),
+                if (r.name_len > 0) " (" else "",
+                r.name(),
+                if (r.name_len > 0) ")" else "",
+                r.lossPct(),
+                r.received,
+                r.sent,
+            }) catch {};
+        }
+    }
+
     stdout.print("\n{s}══════════════════════════════════════════════════════════════{s}\n", .{ bold, reset }) catch {};
+}
+
+fn printJsonField(stdout: StdoutWriter, key: []const u8, v: ?u64) void {
+    if (v) |x| {
+        stdout.print("\"{s}\": {d}", .{ key, x }) catch {};
+    } else {
+        stdout.print("\"{s}\": null", .{key}) catch {};
+    }
+}
+
+// One-shot machine-readable output (--json): the whole scan as a single
+// JSON document. Latency fields are integers in microseconds, null where
+// the host produced no sample.
+fn printJson(stdout: StdoutWriter, results: []const PingResult, config: Config) void {
+    stdout.print("{{\n", .{}) catch {};
+    stdout.print("  \"schema_version\": 1,\n", .{}) catch {};
+    stdout.print("  \"scanned_at_unix_us\": {d},\n", .{wallMicros()}) catch {};
+    stdout.print("  \"subnet\": \"{d}.{d}.{d}.{d}/{d}\",\n", .{
+        config.subnet[0], config.subnet[1], config.subnet[2], config.subnet[3], config.mask_bits,
+    }) catch {};
+    stdout.print("  \"pings_per_host\": {d},\n", .{config.latency_pings}) catch {};
+    stdout.print("  \"hosts\": [", .{}) catch {};
+    for (results, 0..) |*r, i| {
+        stdout.print("{s}\n    {{ \"ip\": \"{d}.{d}.{d}.{d}\", \"name\": ", .{
+            if (i == 0) "" else ",", r.ip[0], r.ip[1], r.ip[2], r.ip[3],
+        }) catch {};
+        if (r.name_len > 0) {
+            common.writeJsonString(stdout, r.name());
+        } else {
+            stdout.print("null", .{}) catch {};
+        }
+        stdout.print(", ", .{}) catch {};
+        printJsonField(stdout, "min_us", r.latency_us);
+        stdout.print(", ", .{}) catch {};
+        printJsonField(stdout, "avg_us", r.latency_avg);
+        stdout.print(", ", .{}) catch {};
+        printJsonField(stdout, "max_us", r.latency_max);
+        stdout.print(", ", .{}) catch {};
+        printJsonField(stdout, "jitter_us", r.jitter_us);
+        stdout.print(", \"sent\": {d}, \"received\": {d}, \"loss_pct\": {d} }}", .{
+            r.sent, r.received, r.lossPct(),
+        }) catch {};
+    }
+    stdout.print("{s}]\n}}\n", .{if (results.len == 0) "" else "\n  "}) catch {};
 }
 
 fn printLegend(stdout: StdoutWriter) void {
@@ -1185,6 +1321,50 @@ fn parseSubnet(arg: []const u8) ?struct { subnet: [4]u8, mask: u8 } {
     return .{ .subnet = u32ToIp(base), .mask = mask };
 }
 
+// Reverse-DNS resolution for scan results, run after measurement so the
+// blocking lookups never sit in the probe path. A small worker pool pulls
+// hosts off a shared counter; workers stop starting new lookups once the
+// soft deadline passes, so an unresponsive DNS server costs seconds, not
+// minutes (one in-flight lookup can still overrun the deadline — pass
+// --no-names when even that is too much).
+const resolve_threads_max = 8;
+const resolve_deadline_us: i64 = 3 * std.time.us_per_s;
+
+const ResolveState = struct {
+    results: []PingResult,
+    next: std.atomic.Value(usize),
+    deadline: i64,
+};
+
+fn resolveWorker(state: *ResolveState) void {
+    while (true) {
+        const i = state.next.fetchAdd(1, .seq_cst);
+        if (i >= state.results.len) return;
+        if (monotonicMicros() > state.deadline) return;
+        var buf: [64]u8 = @splat(0);
+        const r = &state.results[i];
+        const addr_be = std.mem.bytesToValue(u32, &r.ip);
+        if (plat.lookupPtrName(addr_be, &buf)) |n| r.setName(n);
+    }
+}
+
+fn resolveNames(results: []PingResult) void {
+    if (results.len == 0) return;
+    var state = ResolveState{
+        .results = results,
+        .next = std.atomic.Value(usize).init(0),
+        .deadline = monotonicMicros() + resolve_deadline_us,
+    };
+    var threads: [resolve_threads_max]?std.Thread = @splat(null);
+    const n = @min(results.len, resolve_threads_max);
+    for (threads[0..n]) |*t| {
+        t.* = std.Thread.spawn(.{}, resolveWorker, .{&state}) catch null;
+    }
+    for (threads[0..n]) |t| {
+        if (t) |thread| thread.join();
+    }
+}
+
 // Run one full discovery + latency scan. Returns owned results sorted by IP;
 // empty (not an error) when nothing responded, so mesh mode can keep going.
 fn runScanOnce(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWriter) ![]PingResult {
@@ -1202,6 +1382,7 @@ fn runScanOnce(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
     if (results.len > 0) {
         stdout.print("\n", .{}) catch {};
         try scanner.measureLatency(alive_hosts.items, results, stdout);
+        if (scanner.config.resolve_names) resolveNames(results);
     }
     return results;
 }
@@ -1215,6 +1396,7 @@ fn runMeshMode(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
         config.subnet,
         config.mask_bits,
         config.tcp_targets[0..config.tcp_target_count],
+        config.mesh_key,
     ) catch |err| {
         std.debug.print("Error: failed to open mesh UDP socket on port {d}: {s}\n", .{ config.mesh_port, @errorName(err) });
         return err;
@@ -1237,6 +1419,21 @@ fn runMeshMode(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
         scanner.tick_ctx = null;
     }
 
+    // Optional HTTP endpoint: the server thread serves byte snapshots that
+    // this loop refreshes; it never touches mesh state itself
+    var http_server: ?httpd.Server = null;
+    defer if (http_server) |*srv| srv.deinit();
+    if (config.http_port != 0) {
+        http_server = httpd.Server.init(allocator, config.http_port) catch |err| {
+            std.debug.print("Error: failed to open HTTP endpoint on port {d}: {s}\n", .{ config.http_port, @errorName(err) });
+            return err;
+        };
+        try http_server.?.start();
+        stdout.print("  HTTP endpoint on port {d}: /json, /metrics\n", .{config.http_port}) catch {};
+    }
+    const snapshot_interval_us: i64 = 2 * std.time.us_per_s;
+    var next_snapshot_at: i64 = 0;
+
     const rescan_us: i64 = @as(i64, config.rescan_interval_s) * std.time.us_per_s;
     var next_scan_at: i64 = monotonicMicros(); // first scan runs immediately
 
@@ -1253,6 +1450,21 @@ fn runMeshMode(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
         }
         mesh.pump();
         mesh.renderIfDue(stdout, if (rescan_us > 0) next_scan_at else null);
+
+        if (http_server) |*srv| {
+            const snap_now = monotonicMicros();
+            if (snap_now >= next_snapshot_at and mesh.local_scan_us > 0) {
+                next_snapshot_at = snap_now + snapshot_interval_us;
+                var jw = std.Io.Writer.Allocating.init(allocator);
+                defer jw.deinit();
+                var mw = std.Io.Writer.Allocating.init(allocator);
+                defer mw.deinit();
+                mesh.writeJson(&jw.writer);
+                mesh.writeMetrics(&mw.writer);
+                srv.setSnapshots(jw.writer.buffered(), mw.writer.buffered());
+            }
+        }
+
         // Sleep until mesh traffic arrives or a short tick elapses
         _ = mesh.poller.wait(100);
     }
@@ -1324,6 +1536,19 @@ pub fn main(init: std.process.Init) !void {
                 \\              port (SYN→SYN-ACK, or RST from a closed port — both time
                 \\              the host's stack). Works on devices not running this
                 \\              tool; repeatable, up to 16 targets
+                \\  --http <port>  Mesh mode: serve the live mesh state over HTTP —
+                \\              /json (full snapshot) and /metrics (Prometheus) — so
+                \\              Grafana or scripts can scrape any node
+                \\  --mesh-key <secret>  Mesh mode: authenticate every mesh datagram
+                \\              with an HMAC tag; nodes without the same key are
+                \\              ignored. Authenticates, does not encrypt; give every
+                \\              node the same secret
+                \\  --json      One-shot scan: print results as a JSON document on
+                \\              stdout (progress and decoration are suppressed);
+                \\              not applicable to --mesh, which serves --http instead
+                \\  --no-names  Skip reverse-DNS lookups of discovered hosts (names
+                \\              come from the system resolver after each scan, with a
+                \\              soft time budget so slow DNS can't stall the scanner)
                 \\  --no-color  Disable colored output (also disabled when stdout is
                 \\              not a terminal, or the NO_COLOR env var is set)
                 \\  -h, --help  Show this help
@@ -1363,6 +1588,10 @@ pub fn main(init: std.process.Init) !void {
                 return invalidArgValue("-t", value);
         } else if (std.mem.eql(u8, arg, "--no-color")) {
             no_color = true;
+        } else if (std.mem.eql(u8, arg, "--no-names")) {
+            config.resolve_names = false;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            config.json = true;
         } else if (std.mem.eql(u8, arg, "--mesh")) {
             config.mesh = true;
         } else if (std.mem.eql(u8, arg, "--mesh-port")) {
@@ -1370,6 +1599,15 @@ pub fn main(init: std.process.Init) !void {
             config.mesh_port = std.fmt.parseInt(u16, value, 10) catch
                 return invalidArgValue("--mesh-port", value);
             if (config.mesh_port == 0) return invalidArgValue("--mesh-port", value);
+        } else if (std.mem.eql(u8, arg, "--mesh-key")) {
+            const value = nextArgValue(args, &i);
+            if (value.len == 0) return invalidArgValue("--mesh-key", value);
+            config.mesh_key = mesh_mod.deriveKey(value);
+        } else if (std.mem.eql(u8, arg, "--http")) {
+            const value = nextArgValue(args, &i);
+            config.http_port = std.fmt.parseInt(u16, value, 10) catch
+                return invalidArgValue("--http", value);
+            if (config.http_port == 0) return invalidArgValue("--http", value);
         } else if (std.mem.eql(u8, arg, "-i")) {
             const value = nextArgValue(args, &i);
             config.rescan_interval_s = std.fmt.parseInt(u32, value, 10) catch
@@ -1402,17 +1640,34 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Error: --tcp-ping targets are probed by mesh mode; add --mesh\n", .{});
         std.process.exit(1);
     }
+    if (config.json and config.mesh) {
+        std.debug.print("Error: --json is for one-shot scans; mesh mode serves machine-readable output over --http\n", .{});
+        std.process.exit(1);
+    }
+    if (config.http_port != 0 and !config.mesh) {
+        std.debug.print("Error: --http serves the mesh matrix; add --mesh (one-shot scans have --json)\n", .{});
+        std.process.exit(1);
+    }
+    if (config.mesh_key != null and !config.mesh) {
+        std.debug.print("Error: --mesh-key authenticates mesh traffic; add --mesh\n", .{});
+        std.process.exit(1);
+    }
 
     common.initTerm(no_color);
+
+    // With --json, stdout carries exactly one JSON document: progress and
+    // decoration go nowhere instead of corrupting it
+    var discard = std.Io.Writer.Discarding.init(&.{});
+    const info_out: StdoutWriter = if (config.json) &discard.writer else stdout;
 
     // Print banner
     const cyan = common.sgr("\x1b[96m");
     const bold = common.sgr("\x1b[1m");
     const reset = common.sgr("\x1b[0m");
-    stdout.print("\n", .{}) catch {};
-    stdout.print("{s}╔══════════════════════════════════════════════════════════════╗{s}\n", .{ cyan, reset }) catch {};
-    stdout.print("{s}║{s}             {s}Network Latency Heatmap Scanner{s}                  {s}║{s}\n", .{ cyan, reset, bold, reset, cyan, reset }) catch {};
-    stdout.print("{s}╚══════════════════════════════════════════════════════════════╝{s}\n", .{ cyan, reset }) catch {};
+    info_out.print("\n", .{}) catch {};
+    info_out.print("{s}╔══════════════════════════════════════════════════════════════╗{s}\n", .{ cyan, reset }) catch {};
+    info_out.print("{s}║{s}             {s}Network Latency Heatmap Scanner{s}                  {s}║{s}\n", .{ cyan, reset, bold, reset, cyan, reset }) catch {};
+    info_out.print("{s}╚══════════════════════════════════════════════════════════════╝{s}\n", .{ cyan, reset }) catch {};
 
     var subnet_buf: [32]u8 = undefined;
     const subnet_str = std.fmt.bufPrint(&subnet_buf, "{}.{}.{}.{}/{}", .{
@@ -1423,19 +1678,19 @@ pub fn main(init: std.process.Init) !void {
         config.mask_bits,
     }) catch "???";
 
-    stdout.print("\n  Subnet: {s}", .{subnet_str}) catch {};
+    info_out.print("\n  Subnet: {s}", .{subnet_str}) catch {};
     if (!subnet_set) {
         if (detected_subnet) |detected| {
-            stdout.print(" (auto-detected on {s}{s})", .{
+            info_out.print(" (auto-detected on {s}{s})", .{
                 detected.name(),
                 if (detected.on_default_route) ", default route" else "",
             }) catch {};
         } else {
-            stdout.print(" (default; no local subnet detected)", .{}) catch {};
+            info_out.print(" (default; no local subnet detected)", .{}) catch {};
         }
     }
-    stdout.print("\n", .{}) catch {};
-    stdout.print("  Discovery timeout: {d}ms | Latency pings: {d} | Ping timeout: {d}ms\n", .{
+    info_out.print("\n", .{}) catch {};
+    info_out.print("  Discovery timeout: {d}ms | Latency pings: {d} | Ping timeout: {d}ms\n", .{
         config.discovery_timeout_ms,
         config.latency_pings,
         config.latency_timeout_ms,
@@ -1445,14 +1700,14 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(full_range);
     const all_ips = full_range[0..removeLocalAddrs(full_range)];
 
-    stdout.print("  Total IPs to scan: {d}", .{all_ips.len}) catch {};
+    info_out.print("  Total IPs to scan: {d}", .{all_ips.len}) catch {};
     if (all_ips.len < full_range.len) {
-        stdout.print(" (excluding {d} own address{s})", .{
+        info_out.print(" (excluding {d} own address{s})", .{
             full_range.len - all_ips.len,
             if (full_range.len - all_ips.len == 1) "" else "es",
         }) catch {};
     }
-    stdout.print("\n", .{}) catch {};
+    info_out.print("\n", .{}) catch {};
 
     // Two-phase scanner
     var scanner = Scanner.init(allocator, all_ips, config) catch |err| {
@@ -1463,7 +1718,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer scanner.deinit();
 
-    stdout.print("  Receive timestamps: {s}\n", .{
+    info_out.print("  Receive timestamps: {s}\n", .{
         if (scanner.kernel_ts_enabled) "kernel (SO_TIMESTAMP)" else "userspace (kernel timestamps unavailable)",
     }) catch {};
 
@@ -1475,10 +1730,15 @@ pub fn main(init: std.process.Init) !void {
         }) catch {};
         return runMeshMode(&scanner, allocator, stdout, config);
     }
-    stdout.print("\n", .{}) catch {};
+    info_out.print("\n", .{}) catch {};
 
-    const results = try runScanOnce(&scanner, allocator, stdout);
+    const results = try runScanOnce(&scanner, allocator, info_out);
     defer allocator.free(results);
+
+    if (config.json) {
+        printJson(stdout, results, config);
+        return;
+    }
 
     if (results.len == 0) {
         stdout.print("\n{s}No devices responded. Are you on the right subnet?{s}\n", .{ common.sgr("\x1b[93m"), reset }) catch {};
@@ -1505,6 +1765,7 @@ test {
     _ = @import("mesh.zig");
     _ = @import("probe.zig");
     _ = @import("plat.zig");
+    _ = @import("httpd.zig");
 }
 
 test "calculateChecksum verifies to zero over a packet containing its own checksum" {
@@ -1629,4 +1890,31 @@ test "LatencyData caps samples and computes min/avg/max" {
 
     for (0..LatencyData.max_samples * 2) |_| data.add(1);
     try testing.expectEqual(@as(u8, LatencyData.max_samples), data.count);
+}
+
+test "LatencyData jitter is stddev of the samples" {
+    var data = LatencyData.init();
+    try testing.expectEqual(@as(?u64, null), data.getJitter());
+
+    data.add(100);
+    try testing.expectEqual(@as(?u64, 0), data.getJitter());
+
+    data.add(300); // mean 200, deviations ±100
+    try testing.expectEqual(@as(?u64, 100), data.getJitter());
+
+    data.add(200); // 100/200/300: variance 20000/3, stddev ~81
+    try testing.expectEqual(@as(?u64, 81), data.getJitter());
+}
+
+test "PingResult lossPct" {
+    var r = PingResult{ .ip = .{ 1, 2, 3, 4 }, .latency_us = null, .latency_avg = null, .latency_max = null };
+    try testing.expectEqual(@as(u8, 0), r.lossPct()); // nothing sent yet
+
+    r.sent = 5;
+    r.received = 5;
+    try testing.expectEqual(@as(u8, 0), r.lossPct());
+    r.received = 4;
+    try testing.expectEqual(@as(u8, 20), r.lossPct());
+    r.received = 0;
+    try testing.expectEqual(@as(u8, 100), r.lossPct());
 }

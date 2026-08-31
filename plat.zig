@@ -55,10 +55,13 @@ pub const win = struct {
     pub extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: ?*const anyopaque, optlen: c_int) callconv(.winapi) c_int;
     pub extern "ws2_32" fn sendto(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int, to: *const anyopaque, tolen: c_int) callconv(.winapi) c_int;
     pub extern "ws2_32" fn recvfrom(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int, from: ?*anyopaque, fromlen: ?*c_int) callconv(.winapi) c_int;
+    pub extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+    pub extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
     pub extern "ws2_32" fn ioctlsocket(s: SOCKET, cmd: c_long, argp: *c_ulong) callconv(.winapi) c_int;
     pub extern "ws2_32" fn WSAPoll(fdArray: [*]WSAPOLLFD, fds: c_ulong, timeout: c_int) callconv(.winapi) c_int;
     pub extern "ws2_32" fn WSAIoctl(s: SOCKET, dwIoControlCode: u32, lpvInBuffer: ?*const anyopaque, cbInBuffer: u32, lpvOutBuffer: ?*anyopaque, cbOutBuffer: u32, lpcbBytesReturned: *u32, lpOverlapped: ?*anyopaque, lpCompletionRoutine: ?*anyopaque) callconv(.winapi) c_int;
     pub extern "ws2_32" fn gethostname(name: [*]u8, namelen: c_int) callconv(.winapi) c_int;
+    pub extern "ws2_32" fn getnameinfo(pSockaddr: *const anyopaque, SockaddrLength: c_int, pNodeBuffer: ?[*]u8, NodeBufferSize: u32, pServiceBuffer: ?[*]u8, ServiceBufferSize: u32, Flags: c_int) callconv(.winapi) c_int;
 
     pub const FILETIME = extern struct {
         low: u32,
@@ -311,6 +314,22 @@ pub fn recvfrom(s: Socket, buf: []u8, addr: ?*anyopaque, addr_len: ?*u32) isize 
     }
 }
 
+pub fn send(s: Socket, buf: []const u8) isize {
+    if (is_windows) {
+        return win.send(s, buf.ptr, @intCast(buf.len), 0);
+    } else {
+        return c.send(s, buf.ptr, buf.len, 0);
+    }
+}
+
+pub fn recv(s: Socket, buf: []u8) isize {
+    if (is_windows) {
+        return win.recv(s, buf.ptr, @intCast(buf.len), 0);
+    } else {
+        return c.recv(s, buf.ptr, buf.len, 0);
+    }
+}
+
 // Poll: WSAPoll on Windows, poll(2) elsewhere. Event constants are
 // normalized; WSAPoll rejects flag combinations it doesn't know, so the
 // Windows values use the RDNORM/WRNORM forms it accepts.
@@ -370,6 +389,32 @@ pub fn getpid() u32 {
 }
 
 extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
+extern "c" fn getnameinfo(addr: *const anyopaque, addrlen: u32, host: ?[*]u8, hostlen: u32, serv: ?[*]u8, servlen: u32, flags: c_int) c_int;
+
+// NI_NAMEREQD: fail instead of returning the numeric address when no PTR
+// record exists. 8 on Linux; 4 on Darwin, the BSDs, and Windows.
+const NI_NAMEREQD: c_int = if (builtin.os.tag == .linux) 8 else 4;
+
+// Reverse-DNS (PTR) lookup for one IPv4 address, blocking. Resolution goes
+// through the system resolver, so mDNS/NetBIOS names appear too wherever
+// the OS is configured to consult them (nsswitch mdns modules, Windows'
+// LLMNR/NetBIOS fallback). Returns null when the host has no name.
+pub fn lookupPtrName(addr_be: u32, buf: []u8) ?[]const u8 {
+    if (buf.len < 2) return null;
+    var sa = posix.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = addr_be,
+    };
+    const rc = if (is_windows) blk: {
+        netInit();
+        break :blk win.getnameinfo(&sa, @sizeOf(posix.sockaddr.in), buf.ptr, @intCast(buf.len), null, 0, NI_NAMEREQD);
+    } else getnameinfo(&sa, @sizeOf(posix.sockaddr.in), buf.ptr, @intCast(buf.len), null, 0, NI_NAMEREQD);
+    if (rc != 0) return null;
+    const len = std.mem.indexOfScalar(u8, buf, 0) orelse buf.len;
+    if (len == 0) return null;
+    return buf[0..len];
+}
 
 pub fn getHostname(buf: []u8) bool {
     if (is_windows) {

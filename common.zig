@@ -51,6 +51,33 @@ pub const PingResult = struct {
     latency_us: ?u64, // microseconds, null if timeout (min latency)
     latency_avg: ?u64, // average latency
     latency_max: ?u64, // max latency
+    jitter_us: ?u64 = null, // standard deviation of the samples (ping's mdev)
+    sent: u8 = 0, // probes sent to this host in the latency phase
+    received: u8 = 0, // probes answered
+
+    // Reverse-DNS name, filled in after the scan (empty = none found)
+    name_buf: [name_max]u8 = @splat(0),
+    name_len: u8 = 0,
+
+    pub const name_max = 32;
+
+    pub fn name(self: *const PingResult) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+
+    pub fn setName(self: *PingResult, n: []const u8) void {
+        const take = @min(n.len, name_max);
+        @memcpy(self.name_buf[0..take], n[0..take]);
+        self.name_len = @intCast(take);
+    }
+
+    // Packet loss in percent. A host that answered discovery but none of
+    // the latency probes reads as 100%, which is exactly the signal.
+    pub fn lossPct(self: *const PingResult) u8 {
+        if (self.sent == 0) return 0;
+        const lost: u32 = self.sent - @min(self.received, self.sent);
+        return @intCast(lost * 100 / self.sent);
+    }
 };
 
 // Platform-agnostic event poller for socket readiness
@@ -142,6 +169,23 @@ pub const SocketPoller = struct {
     // Non-blocking check if data is available (timeout = 0)
     pub fn poll(self: *SocketPoller) bool {
         return self.wait(0);
+    }
+};
+
+// Minimal blocking lock for cross-thread handoffs: the critical sections
+// copy at most a few kilobytes and contention is one thread every few
+// seconds, so spinning with a scheduler yield is plenty. (Zig 0.16's std
+// has no plain blocking thread mutex — std.Io.Mutex wants an Io instance
+// these modules don't carry.)
+pub const SpinLock = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    pub fn lock(self: *SpinLock) void {
+        while (!self.inner.tryLock()) std.Thread.yield() catch {};
+    }
+
+    pub fn unlock(self: *SpinLock) void {
+        self.inner.unlock();
     }
 };
 
@@ -237,6 +281,23 @@ pub fn formatLatency(latency_us: ?u64, buf: []u8) []const u8 {
     }
 }
 
+// Minimal JSON string emitter: quotes the value and escapes the quote,
+// backslash, and control bytes. Reverse-DNS names and hostnames are the
+// only externally influenced strings we emit, but they ARE externally
+// influenced — never inline them into JSON unescaped.
+pub fn writeJsonString(w: StdoutWriter, s: []const u8) void {
+    w.writeByte('"') catch {};
+    for (s) |ch| {
+        switch (ch) {
+            '"' => w.writeAll("\\\"") catch {},
+            '\\' => w.writeAll("\\\\") catch {},
+            0x00...0x1F => w.print("\\u{x:0>4}", .{ch}) catch {},
+            else => w.writeByte(ch) catch {},
+        }
+    }
+    w.writeByte('"') catch {};
+}
+
 // In-place frame overwrite for live TTY views. Clear-then-redraw
 // (\x1b[2J followed by many small writes) lets the terminal repaint while
 // the screen is blank or half-drawn, which the user sees as flicker.
@@ -323,6 +384,13 @@ test "sgr and latencyToColor collapse to nothing when color is disabled" {
     try testing.expectEqualStrings("\x1b[92m", sgr("\x1b[92m"));
     try testing.expectEqualStrings("\x1b[92m", latencyToColor(500));
     try testing.expectEqualStrings("\x1b[90m", latencyToColor(null));
+}
+
+test "writeJsonString escapes quotes, backslashes, and control bytes" {
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    writeJsonString(&w, "a\"b\\c\n");
+    try testing.expectEqualStrings("\"a\\\"b\\\\c\\u000a\"", w.buffered());
 }
 
 test "encodeFrame overwrites in place: sync wrap, EL per line, ED at end" {

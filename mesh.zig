@@ -5,7 +5,8 @@
 // Protocol (UDP, all multi-byte integers little-endian):
 //
 //   Header (all messages, 13 bytes):
-//     [0..4)   magic "NLH1" (protocol version baked into the magic)
+//     [0..4)   magic "NLH2" (protocol version baked into the magic; "NLS2"
+//              when the mesh runs with --mesh-key, see below)
 //     [4]      message type: 1 = beacon, 2 = results chunk
 //     [5..13)  node id (random u64, identifies a scanner instance)
 //
@@ -20,8 +21,9 @@
 //     [17..19) total entries in this result set
 //     [19..21) offset of this chunk's first entry
 //     [21..23) entry count in this chunk
-//     [23..)   entries, 16 bytes each:
-//                ip [4]u8 (network order), min/avg/max u32 µs
+//     [23..)   entries, 21 bytes each:
+//                ip [4]u8 (network order), min/avg/max/jitter u32 µs,
+//                packet loss u8 (percent)
 //                (0xFFFFFFFF = host discovered but no latency sample)
 //
 //   Ping / pong (types 3 / 4, unicast, measure node↔node UDP RTT):
@@ -66,7 +68,7 @@ const StdoutWriter = common.StdoutWriter;
 
 pub const default_port: u16 = 47269;
 
-const protocol_magic = [4]u8{ 'N', 'L', 'H', '1' };
+const protocol_magic = [4]u8{ 'N', 'L', 'H', '2' };
 const header_len = 13;
 const beacon_fixed_len = header_len + 7; // + seq, host_count, hostname_len
 const results_fixed_len = header_len + 10; // + seq, total, offset, count
@@ -74,9 +76,9 @@ const ping_len = header_len + 8; // + token
 const links_fixed_len = header_len + 2; // + peer link count, target count
 const link_entry_len = 17; // node id, udp avg, tcp avg, flags
 const target_entry_len = 11; // ip, port, tcp avg, flags
-const entry_len = 16;
+const entry_len = 21; // ip, min/avg/max/jitter, loss
 const max_hostname = 32;
-const entries_per_chunk = 80; // 80*16 + 23 = 1303 bytes, under typical MTU
+const entries_per_chunk = 60; // 60*21 + 23 = 1283 bytes, under typical MTU
 const recv_buf_len = 2048;
 
 pub const max_peers = 32;
@@ -102,10 +104,57 @@ const max_display_observers = 6;
 // Sentinel in wire stats: host was discovered but produced no latency sample
 pub const no_data: u32 = 0xFFFF_FFFF;
 
+// --mesh-key: every datagram carries a truncated HMAC-SHA256 tag, so only
+// nodes sharing the key can join the mesh, inject results, or forge pongs.
+// The secured protocol uses its own magic ("NLS2"): a keyed and an unkeyed
+// mesh on the same LAN ignore each other cleanly instead of forming a
+// confusing half-mesh. This authenticates and integrity-protects; it does
+// NOT encrypt (results are readable on the wire) and does not prevent
+// replay of captured datagrams.
+pub const secured_magic = [4]u8{ 'N', 'L', 'S', '2' };
+pub const mac_len = 16;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+
+// The CLI passphrase is hashed once into a fixed-size HMAC key
+pub fn deriveKey(secret: []const u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(secret, &out, .{});
+    return out;
+}
+
+// Copy msg into out, stamp the secured magic, append the tag. The tag is
+// computed over the stamped message, so it also binds the magic.
+pub fn sealMessage(key: *const [32]u8, msg: []const u8, out: []u8) []const u8 {
+    std.debug.assert(out.len >= msg.len + mac_len);
+    std.debug.assert(msg.len >= header_len);
+    @memcpy(out[0..msg.len], msg);
+    @memcpy(out[0..4], &secured_magic);
+    var tag: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&tag, out[0..msg.len], key);
+    @memcpy(out[msg.len..][0..mac_len], tag[0..mac_len]);
+    return out[0 .. msg.len + mac_len];
+}
+
+// Verify and strip the tag in place; returns the plain-protocol message
+// (magic rewritten) or null for anything unauthenticated or tampered.
+pub fn openMessage(key: *const [32]u8, buf: []u8) ?[]u8 {
+    if (buf.len < header_len + mac_len) return null;
+    const body = buf[0 .. buf.len - mac_len];
+    var tag: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&tag, body, key);
+    const got: [mac_len]u8 = buf[buf.len - mac_len ..][0..mac_len].*;
+    if (!std.crypto.timing_safe.eql([mac_len]u8, tag[0..mac_len].*, got)) return null;
+    if (!std.mem.eql(u8, body[0..4], &secured_magic)) return null;
+    @memcpy(body[0..4], &protocol_magic);
+    return body;
+}
+
 pub const HostStats = struct {
     min_us: u32,
     avg_us: u32,
     max_us: u32,
+    jitter_us: u32 = no_data,
+    loss_pct: u8 = 0,
 
     pub fn hasData(self: HostStats) bool {
         return self.avg_us != no_data;
@@ -204,6 +253,8 @@ pub fn encodeResultsChunk(buf: []u8, node_id: u64, seq: u32, total: u16, offset:
         std.mem.writeInt(u32, buf[off + 4 ..][0..4], e.stats.min_us, .little);
         std.mem.writeInt(u32, buf[off + 8 ..][0..4], e.stats.avg_us, .little);
         std.mem.writeInt(u32, buf[off + 12 ..][0..4], e.stats.max_us, .little);
+        std.mem.writeInt(u32, buf[off + 16 ..][0..4], e.stats.jitter_us, .little);
+        buf[off + 20] = e.stats.loss_pct;
         off += entry_len;
     }
     return buf[0..off];
@@ -273,6 +324,8 @@ pub fn decodeEntry(bytes: []const u8) Entry {
             .min_us = std.mem.readInt(u32, bytes[4..8], .little),
             .avg_us = std.mem.readInt(u32, bytes[8..12], .little),
             .max_us = std.mem.readInt(u32, bytes[12..16], .little),
+            .jitter_us = std.mem.readInt(u32, bytes[16..20], .little),
+            .loss_pct = @min(bytes[20], 100),
         },
     };
 }
@@ -345,6 +398,56 @@ pub fn spreadIsUneven(min_avg: u64, max_avg: u64) bool {
     return max_avg >= min_avg * 3 and (max_avg - min_avg) > 2000;
 }
 
+// Probe loss at or above this is flagged in the matrix and the insights:
+// with 5 probes per round, 20% is one dropped probe — anything recurring
+// at that level is a real symptom, not sampling noise.
+pub const loss_flag_pct: u8 = 20;
+
+// Rolling per-host history of scan averages from this node's own vantage,
+// so a rescan loop can tell "this host degraded twenty minutes ago" from
+// "this host has always been slow". A snapshot can't; the history can.
+pub const history_len = 16;
+
+pub const HostHistory = struct {
+    avgs: [history_len]u32 = undefined,
+    count: u8 = 0,
+    idx: u8 = 0,
+
+    pub fn push(self: *HostHistory, avg_us: u32) void {
+        self.avgs[self.idx] = avg_us;
+        self.idx = (self.idx + 1) % history_len;
+        if (self.count < history_len) self.count += 1;
+    }
+
+    pub fn latest(self: *const HostHistory) ?u32 {
+        if (self.count == 0) return null;
+        return self.avgs[(self.idx + history_len - 1) % history_len];
+    }
+
+    // Median of everything before the newest sample — the baseline the
+    // current scan is judged against. Needs a few scans of history first;
+    // the median makes one earlier outlier unable to fake a baseline.
+    pub fn baseline(self: *const HostHistory) ?u32 {
+        if (self.count < 4) return null;
+        var tmp: [history_len]u32 = undefined;
+        const n: usize = self.count - 1;
+        for (0..n) |i| {
+            // Oldest-first walk that skips the newest entry
+            tmp[i] = self.avgs[(self.idx + history_len - self.count + @as(u8, @intCast(i))) % history_len];
+        }
+        std.mem.sort(u32, tmp[0..n], {}, std.sort.asc(u32));
+        return tmp[n / 2];
+    }
+
+    // Same shape as spreadIsUneven: a trend needs both the ratio and an
+    // absolute gap bigger than jitter noise
+    pub fn degraded(self: *const HostHistory) bool {
+        const base = self.baseline() orelse return false;
+        const cur = self.latest() orelse return false;
+        return cur >= @as(u64, base) * 3 and cur - base > 2000;
+    }
+};
+
 fn medianOfSorted(sorted: []const u64) ?u64 {
     if (sorted.len == 0) return null;
     return sorted[sorted.len / 2];
@@ -399,6 +502,16 @@ const Peer = struct {
     }
 };
 
+// A cached reverse-DNS name for one scanned host
+const NameEntry = struct {
+    buf: [common.PingResult.name_max]u8,
+    len: u8,
+
+    fn name(self: *const NameEntry) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 // TCP RTT results for one peer, produced by the prober thread. Keyed by
 // node id (not a Peer pointer) because the peer list is owned by the main
 // thread and entries can vanish between probe rounds.
@@ -407,22 +520,7 @@ const PeerTcp = struct {
     stats: probe.ProbeStats,
 };
 
-// Minimal blocking lock for the prober handoff: the critical sections copy
-// a few hundred bytes and contention is one thread every few seconds, so
-// spinning with a scheduler yield is plenty. (Zig 0.16's std has no plain
-// blocking thread mutex — std.Io.Mutex wants an Io instance this module
-// doesn't carry.)
-const SpinLock = struct {
-    inner: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *SpinLock) void {
-        while (!self.inner.tryLock()) std.Thread.yield() catch {};
-    }
-
-    fn unlock(self: *SpinLock) void {
-        self.inner.unlock();
-    }
-};
+const SpinLock = common.SpinLock;
 
 // Everything the prober thread and the main thread exchange, under one
 // mutex: the main thread refreshes the peer snapshot each pump and reads
@@ -459,6 +557,7 @@ pub const Mesh = struct {
     tcp_listen: plat.Socket,
     probes: ProbeShared,
     prober: ?std.Thread,
+    key: ?[32]u8, // --mesh-key: authenticate every datagram
     node_id: u64,
     hostname: [max_hostname]u8,
     hostname_len: u8,
@@ -475,6 +574,15 @@ pub const Mesh = struct {
     local_entries: std.ArrayList(Entry),
     local_scan_us: i64, // monotonic time of our last scan, 0 = never
 
+    // Reverse-DNS names from our own scans. Names are not gossiped — every
+    // node asks the same resolver anyway — so rows only this node's peers
+    // scanned show as bare IPs.
+    names: std.AutoHashMap(u32, NameEntry),
+
+    // Per-host history of scan averages from this node's vantage, for the
+    // degradation insight (local only; peers run their own history)
+    hist: std.AutoHashMap(u32, HostHistory),
+
     peers: std.ArrayList(Peer),
 
     last_beacon_us: i64,
@@ -483,7 +591,7 @@ pub const Mesh = struct {
     last_countdown_s: i64, // rescan countdown shown by the last render, -1 = none
     dirty: bool,
 
-    pub fn init(allocator: std.mem.Allocator, port: u16, subnet: [4]u8, mask_bits: u8, tcp_targets: []const probe.TcpTarget) !Mesh {
+    pub fn init(allocator: std.mem.Allocator, port: u16, subnet: [4]u8, mask_bits: u8, tcp_targets: []const probe.TcpTarget, key: ?[32]u8) !Mesh {
         plat.netInit();
         const sock = plat.openSocket(plat.AF_INET, plat.SOCK_DGRAM, 0);
         if (!plat.isValidSocket(sock)) return error.MeshSocketFailed;
@@ -570,6 +678,7 @@ pub const Mesh = struct {
             .tcp_listen = tcp_listen,
             .probes = probes,
             .prober = null,
+            .key = key,
             .node_id = node_id,
             .hostname = hostname_buf,
             .hostname_len = hostname_len,
@@ -589,6 +698,8 @@ pub const Mesh = struct {
             .local_hosts = std.AutoHashMap(u32, HostStats).init(allocator),
             .local_entries = .empty,
             .local_scan_us = 0,
+            .names = std.AutoHashMap(u32, NameEntry).init(allocator),
+            .hist = std.AutoHashMap(u32, HostHistory).init(allocator),
             .peers = .empty,
             .last_beacon_us = 0,
             .last_gossip_us = 0,
@@ -611,6 +722,8 @@ pub const Mesh = struct {
         self.peers.deinit(self.allocator);
         self.local_hosts.deinit();
         self.local_entries.deinit(self.allocator);
+        self.names.deinit();
+        self.hist.deinit();
         self.poller.deinit();
         if (plat.isValidSocket(self.tcp_listen)) plat.closeSocket(self.tcp_listen);
         plat.closeSocket(self.sock);
@@ -708,10 +821,22 @@ pub const Mesh = struct {
                 .min_us = clampStat(r.latency_us),
                 .avg_us = clampStat(r.latency_avg),
                 .max_us = clampStat(r.latency_max),
+                .jitter_us = clampStat(r.jitter_us),
+                .loss_pct = r.lossPct(),
             };
             const ip = ipToU32(r.ip);
             try self.local_hosts.put(ip, stats);
             try self.local_entries.append(self.allocator, .{ .ip = ip, .stats = stats });
+            if (r.name_len > 0) {
+                var ne = NameEntry{ .buf = undefined, .len = r.name_len };
+                @memcpy(ne.buf[0..r.name_len], r.name());
+                try self.names.put(ip, ne);
+            }
+            if (stats.hasData()) {
+                const gop = try self.hist.getOrPut(ip);
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+                gop.value_ptr.push(stats.avg_us);
+            }
         }
 
         self.local_scan_us = monotonicMicros();
@@ -727,6 +852,12 @@ pub const Mesh = struct {
     fn sendDatagram(self: *Mesh, data: []const u8, dest: *const posix.sockaddr.in) void {
         // Errors (buffer full, unreachable) are ignored: beacons and gossip
         // repeat on an interval, so a dropped datagram heals itself
+        if (self.key) |*k| {
+            var sealed_buf: [recv_buf_len]u8 = undefined;
+            const sealed = sealMessage(k, data, &sealed_buf);
+            _ = plat.sendto(self.sock, sealed, dest, @sizeOf(posix.sockaddr.in));
+            return;
+        }
         _ = plat.sendto(self.sock, data, dest, @sizeOf(posix.sockaddr.in));
     }
 
@@ -969,7 +1100,11 @@ pub const Mesh = struct {
             const rc = plat.recvfrom(self.sock, &buf, &src, &src_len);
             if (rc <= 0) break;
             if (src.family != posix.AF.INET) continue;
-            const parsed = parseMessage(buf[0..@intCast(rc)]) orelse continue;
+            var msg: []u8 = buf[0..@intCast(rc)];
+            if (self.key) |*k| {
+                msg = openMessage(k, msg) orelse continue;
+            }
+            const parsed = parseMessage(msg) orelse continue;
             self.handleMessage(parsed, &src, now);
         }
     }
@@ -1094,6 +1229,108 @@ pub const Mesh = struct {
         return o;
     }
 
+    // Assemble the observer columns: self first, then live peers
+    fn collectObservers(self: *Mesh, observers: *[1 + max_peers]Observer, now: i64) usize {
+        observers[0] = makeObserver("self", self.node_id, &self.local_hosts, if (self.local_scan_us > 0) now - self.local_scan_us else -1);
+        var num_obs: usize = 1;
+        for (self.peers.items) |*p| {
+            if (num_obs >= observers.len) break;
+            var ip_buf: [16]u8 = undefined;
+            const peer_ip: [4]u8 = @bitCast(p.addr.addr);
+            const label_text = if (p.hostname_len > 0) p.name() else ipToString(peer_ip, &ip_buf);
+            const age: i64 = if (p.last_results_us > 0) now - p.last_results_us else -1;
+            observers[num_obs] = makeObserver(label_text, p.node_id, &p.hosts, age);
+            num_obs += 1;
+        }
+        return num_obs;
+    }
+
+    // Row set: every host any observer has measured, sorted by IP
+    fn collectRows(self: *Mesh, observers: []const Observer) std.ArrayList(u32) {
+        var row_set = std.AutoHashMap(u32, void).init(self.allocator);
+        defer row_set.deinit();
+        for (observers) |*o| {
+            var it = o.hosts.keyIterator();
+            while (it.next()) |k| row_set.put(k.*, {}) catch {};
+        }
+        var rows: std.ArrayList(u32) = .empty;
+        var kit = row_set.keyIterator();
+        while (kit.next()) |k| rows.append(self.allocator, k.*) catch {};
+        std.mem.sort(u32, rows.items, {}, std.sort.asc(u32));
+        return rows;
+    }
+
+    // One consistent copy of the prober thread's results, taken under the
+    // lock so rendering and snapshot building can work unlocked
+    const ProbeSnapshot = struct {
+        peer_tcp: [max_peers]PeerTcp,
+        peer_tcp_count: usize,
+        extras: [probe.max_targets]probe.TcpTarget,
+        extra_tcp: [probe.max_targets]probe.ProbeStats,
+        extra_count: usize,
+    };
+
+    fn snapshotProbes(self: *Mesh) ProbeSnapshot {
+        var snap: ProbeSnapshot = undefined;
+        self.probes.mutex.lock();
+        defer self.probes.mutex.unlock();
+        snap.peer_tcp_count = self.probes.peer_tcp_count;
+        @memcpy(snap.peer_tcp[0..snap.peer_tcp_count], self.probes.peer_tcp[0..snap.peer_tcp_count]);
+        snap.extra_count = self.probes.extra_count;
+        @memcpy(snap.extras[0..snap.extra_count], self.probes.extras[0..snap.extra_count]);
+        @memcpy(snap.extra_tcp[0..snap.extra_count], self.probes.extra_tcp[0..snap.extra_count]);
+        return snap;
+    }
+
+    // Union of TCP targets: ours plus everything peers gossip
+    const TargetKey = struct { ip: u32, port: u16 };
+    const max_target_keys = 32;
+
+    fn collectTargetKeys(self: *Mesh, snap: *const ProbeSnapshot, keys: *[max_target_keys]TargetKey) usize {
+        var n: usize = 0;
+        for (snap.extras[0..snap.extra_count]) |t| {
+            if (n >= keys.len) break;
+            keys[n] = .{ .ip = ipToU32(t.ip), .port = t.port };
+            n += 1;
+        }
+        outer: for (self.peers.items) |*p| {
+            for (p.remote_targets[0..p.remote_target_count]) |e| {
+                if (n >= keys.len) break :outer;
+                var seen = false;
+                for (keys[0..n]) |k| {
+                    if (k.ip == e.ip and k.port == e.port) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    keys[n] = .{ .ip = e.ip, .port = e.port };
+                    n += 1;
+                }
+            }
+        }
+        return n;
+    }
+
+    // How `observer` sees TCP target ip:port — our own probe stats when the
+    // observer is us, the peer's gossiped snapshot otherwise
+    fn targetSeenBy(self: *Mesh, o: *const Observer, key: TargetKey, snap: *const ProbeSnapshot) struct { avg: ?u64, refused: bool } {
+        if (o.node_id == self.node_id) {
+            for (snap.extras[0..snap.extra_count], 0..) |t, i| {
+                if (ipToU32(t.ip) == key.ip and t.port == key.port and snap.extra_tcp[i].alive()) {
+                    return .{ .avg = snap.extra_tcp[i].avg(), .refused = snap.extra_tcp[i].refused };
+                }
+            }
+            return .{ .avg = null, .refused = false };
+        }
+        if (self.findPeer(o.node_id)) |p| {
+            if (p.targetStats(key.ip, key.port)) |e| {
+                return .{ .avg = statToOpt(e.tcp_avg), .refused = e.refused };
+            }
+        }
+        return .{ .avg = null, .refused = false };
+    }
+
     fn render(self: *Mesh, stdout: StdoutWriter, now: i64, next_scan_at: ?i64) void {
         if (!common.stdout_is_tty) {
             // Piped: each render is an appended plain-text snapshot
@@ -1123,34 +1360,12 @@ pub const Mesh = struct {
         const label_width = 17;
         const pad = " " ** 32;
 
-        // Assemble the observer columns: self first, then live peers
         var observers: [1 + max_peers]Observer = undefined;
-        var num_obs: usize = 0;
-        observers[0] = makeObserver("self", self.node_id, &self.local_hosts, if (self.local_scan_us > 0) now - self.local_scan_us else -1);
-        num_obs = 1;
-        for (self.peers.items) |*p| {
-            if (num_obs >= observers.len) break;
-            var ip_buf: [16]u8 = undefined;
-            const peer_ip: [4]u8 = @bitCast(p.addr.addr);
-            const label_text = if (p.hostname_len > 0) p.name() else ipToString(peer_ip, &ip_buf);
-            const age: i64 = if (p.last_results_us > 0) now - p.last_results_us else -1;
-            observers[num_obs] = makeObserver(label_text, p.node_id, &p.hosts, age);
-            num_obs += 1;
-        }
+        const num_obs = self.collectObservers(&observers, now);
         const shown_obs = @min(num_obs, max_display_observers);
 
-        // Row set: every host any observer has measured
-        var row_set = std.AutoHashMap(u32, void).init(self.allocator);
-        defer row_set.deinit();
-        for (observers[0..num_obs]) |*o| {
-            var it = o.hosts.keyIterator();
-            while (it.next()) |k| row_set.put(k.*, {}) catch {};
-        }
-        var rows: std.ArrayList(u32) = .empty;
+        var rows = self.collectRows(observers[0..num_obs]);
         defer rows.deinit(self.allocator);
-        var kit = row_set.keyIterator();
-        while (kit.next()) |k| rows.append(self.allocator, k.*) catch {};
-        std.mem.sort(u32, rows.items, {}, std.sort.asc(u32));
 
         stdout.print("{s}╔══════════════════════════════════════════════════════════════╗{s}\n", .{ cyan, reset }) catch {};
         stdout.print("{s}║{s}               {s}Network Latency Mesh View{s}                      {s}║{s}\n", .{ cyan, reset, bold, reset, cyan, reset }) catch {};
@@ -1198,6 +1413,7 @@ pub const Mesh = struct {
         // Matrix body
         const shown_rows = @min(rows.items.len, max_display_rows);
         var uneven_count: usize = 0;
+        var lossy_count: usize = 0;
         for (rows.items[0..shown_rows]) |ip| {
             var ip_buf: [16]u8 = undefined;
             const ip_str = ipToString(u32ToIp(ip), &ip_buf);
@@ -1206,6 +1422,7 @@ pub const Mesh = struct {
             var row_min: u64 = std.math.maxInt(u64);
             var row_max: u64 = 0;
             var row_samples: usize = 0;
+            var row_lossy = false;
             for (observers[0..shown_obs]) |*o| {
                 const stats = o.hosts.get(ip);
                 const avg: ?u64 = if (stats) |s| s.avg() else null;
@@ -1214,17 +1431,27 @@ pub const Mesh = struct {
                     row_max = @max(row_max, a);
                     row_samples += 1;
                 }
+                const lossy = if (stats) |s| s.loss_pct >= loss_flag_pct else false;
+                if (lossy) row_lossy = true;
                 var lat_buf: [16]u8 = undefined;
                 const lat_str = formatLatency(avg, &lat_buf);
                 const color = latencyToColor(avg);
                 const block = latencyToBlock(avg);
-                stdout.print("{s}{s} {s}{s}", .{ color, block, lat_str, reset }) catch {};
-                const used = 2 + displayWidth(lat_str);
+                const loss_mark = if (lossy) "!" else "";
+                stdout.print("{s}{s} {s}{s}{s}{s}{s}", .{
+                    color,                     block, lat_str, reset,
+                    common.sgr("\x1b[91m"), loss_mark, reset,
+                }) catch {};
+                const used = 2 + displayWidth(lat_str) + loss_mark.len;
                 stdout.print("{s}", .{pad[0..@max(1, col_width - @min(used, col_width - 1))]}) catch {};
             }
+            if (row_lossy) lossy_count += 1;
             if (row_samples >= 2 and spreadIsUneven(row_min, row_max)) {
                 uneven_count += 1;
-                stdout.print("{s}◀ uneven{s}", .{ yellow, reset }) catch {};
+                stdout.print("{s}◀ uneven{s} ", .{ yellow, reset }) catch {};
+            }
+            if (self.names.get(ip)) |ne| {
+                stdout.print("{s}{s}{s}", .{ gray, ne.name(), reset }) catch {};
             }
             stdout.print("\n", .{}) catch {};
         }
@@ -1232,10 +1459,13 @@ pub const Mesh = struct {
             stdout.print("  {s}... +{d} more targets{s}\n", .{ gray, rows.items.len - shown_rows, reset }) catch {};
         }
 
-        stdout.print("\n  {s}avg latency as seen from each observer · {s}◀ uneven{s}{s} = slowest vantage ≥3x fastest{s}\n", .{ gray, yellow, reset, gray, reset }) catch {};
+        stdout.print("\n  {s}avg latency as seen from each observer · {s}◀ uneven{s}{s} = slowest vantage ≥3x fastest · {s}!{s}{s} = ≥{d}% probe loss{s}\n", .{
+            gray,  yellow,                  reset, gray, common.sgr("\x1b[91m"), reset, gray,
+            loss_flag_pct, reset,
+        }) catch {};
 
         self.renderLinks(stdout, observers[0..num_obs], shown_obs);
-        self.renderInsights(stdout, observers[0..num_obs], rows.items, uneven_count);
+        self.renderInsights(stdout, observers[0..num_obs], rows.items, uneven_count, lossy_count);
     }
 
     const Link = struct { udp: ?u64, tcp: ?u64, refused: bool };
@@ -1282,47 +1512,11 @@ pub const Mesh = struct {
         const label_width = 17;
         const pad = " " ** 32;
 
-        // Copy the prober's results out under the lock; render unlocked
-        var peer_tcp: [max_peers]PeerTcp = undefined;
-        var peer_tcp_count: usize = 0;
-        var extras: [probe.max_targets]probe.TcpTarget = undefined;
-        var extra_tcp: [probe.max_targets]probe.ProbeStats = undefined;
-        var extra_count: usize = 0;
-        {
-            self.probes.mutex.lock();
-            defer self.probes.mutex.unlock();
-            peer_tcp_count = self.probes.peer_tcp_count;
-            @memcpy(peer_tcp[0..peer_tcp_count], self.probes.peer_tcp[0..peer_tcp_count]);
-            extra_count = self.probes.extra_count;
-            @memcpy(extras[0..extra_count], self.probes.extras[0..extra_count]);
-            @memcpy(extra_tcp[0..extra_count], self.probes.extra_tcp[0..extra_count]);
-        }
+        // One consistent copy of the prober's results; render unlocked
+        const snap = self.snapshotProbes();
 
-        // Union of TCP targets: ours plus everything peers gossip
-        const TargetKey = struct { ip: u32, port: u16 };
-        var target_keys: [32]TargetKey = undefined;
-        var n_targets: usize = 0;
-        for (extras[0..extra_count]) |t| {
-            if (n_targets >= target_keys.len) break;
-            target_keys[n_targets] = .{ .ip = ipToU32(t.ip), .port = t.port };
-            n_targets += 1;
-        }
-        outer: for (self.peers.items) |*p| {
-            for (p.remote_targets[0..p.remote_target_count]) |e| {
-                if (n_targets >= target_keys.len) break :outer;
-                var seen = false;
-                for (target_keys[0..n_targets]) |k| {
-                    if (k.ip == e.ip and k.port == e.port) {
-                        seen = true;
-                        break;
-                    }
-                }
-                if (!seen) {
-                    target_keys[n_targets] = .{ .ip = e.ip, .port = e.port };
-                    n_targets += 1;
-                }
-            }
-        }
+        var target_keys: [max_target_keys]TargetKey = undefined;
+        const n_targets = self.collectTargetKeys(&snap, &target_keys);
 
         if (observers.len <= 1 and n_targets == 0) return;
 
@@ -1346,7 +1540,7 @@ pub const Mesh = struct {
                         stdout.print("{s}—{s}{s}", .{ gray, reset, pad[0 .. col_width - 1] }) catch {};
                         continue;
                     }
-                    printLinkCell(stdout, self.linkBetween(col, row.node_id, peer_tcp[0..peer_tcp_count]), col_width);
+                    printLinkCell(stdout, self.linkBetween(col, row.node_id, snap.peer_tcp[0..snap.peer_tcp_count]), col_width);
                 }
                 stdout.print("\n", .{}) catch {};
             }
@@ -1369,26 +1563,8 @@ pub const Mesh = struct {
                 stdout.print("  {s}{s}", .{ shown, pad[0 .. label_width - shown.len] }) catch {};
 
                 for (observers[0..shown_obs]) |*col| {
-                    if (col.node_id == self.node_id) {
-                        var avg: ?u64 = null;
-                        var refused = false;
-                        for (extras[0..extra_count], 0..) |t, i| {
-                            if (ipToU32(t.ip) == k.ip and t.port == k.port and extra_tcp[i].alive()) {
-                                avg = extra_tcp[i].avg();
-                                refused = extra_tcp[i].refused;
-                                break;
-                            }
-                        }
-                        printTcpCell(stdout, avg, refused, col_width);
-                    } else if (self.findPeer(col.node_id)) |p| {
-                        if (p.targetStats(k.ip, k.port)) |e| {
-                            printTcpCell(stdout, statToOpt(e.tcp_avg), e.refused, col_width);
-                        } else {
-                            printTcpCell(stdout, null, false, col_width);
-                        }
-                    } else {
-                        printTcpCell(stdout, null, false, col_width);
-                    }
+                    const seen = self.targetSeenBy(col, k, &snap);
+                    printTcpCell(stdout, seen.avg, seen.refused, col_width);
                 }
                 stdout.print("\n", .{}) catch {};
             }
@@ -1430,7 +1606,7 @@ pub const Mesh = struct {
 
     // Column-level analysis: an observer whose median latency to everything
     // is far above the mesh-wide median is itself poorly connected
-    fn renderInsights(self: *Mesh, stdout: StdoutWriter, observers: []const Observer, rows: []const u32, uneven_count: usize) void {
+    fn renderInsights(self: *Mesh, stdout: StdoutWriter, observers: []const Observer, rows: []const u32, uneven_count: usize, lossy_count: usize) void {
         const reset = common.sgr("\x1b[0m");
         const yellow = common.sgr("\x1b[93m");
         var all_avgs: std.ArrayList(u64) = .empty;
@@ -1480,6 +1656,240 @@ pub const Mesh = struct {
                 if (uneven_count == 1) "" else "s",
             }) catch {};
         }
+        if (lossy_count > 0) {
+            if (!printed_header) {
+                stdout.print("\n  {s}⚠ Insights:{s}\n", .{ yellow, reset }) catch {};
+                printed_header = true;
+            }
+            stdout.print("    {d} target{s} dropping ≥{d}% of probes — a host can average fast while losing packets (radio interference, power saving, overload)\n", .{
+                lossy_count,
+                if (lossy_count == 1) "" else "s",
+                loss_flag_pct,
+            }) catch {};
+        }
+
+        // Trend detection against this node's own scan history: a host that
+        // is slow NOW but wasn't over the last scans is a fresh problem, not
+        // a slow device — a snapshot can't tell those apart
+        var degraded_shown: usize = 0;
+        var hit = self.hist.iterator();
+        while (hit.next()) |e| {
+            if (degraded_shown >= 5) break;
+            if (!e.value_ptr.degraded()) continue;
+            if (!self.local_hosts.contains(e.key_ptr.*)) continue; // aged out
+            if (!printed_header) {
+                stdout.print("\n  {s}⚠ Insights:{s}\n", .{ yellow, reset }) catch {};
+                printed_header = true;
+            }
+            var ip_buf: [16]u8 = undefined;
+            var cur_buf: [16]u8 = undefined;
+            var base_buf: [16]u8 = undefined;
+            var name_store: [common.PingResult.name_max]u8 = undefined;
+            var name_str: []const u8 = "";
+            if (self.names.get(e.key_ptr.*)) |ne| {
+                @memcpy(name_store[0..ne.len], ne.name());
+                name_str = name_store[0..ne.len];
+            }
+            stdout.print("    {s}{s}{s}{s} degraded: {s} this scan vs {s} median over the previous {d}\n", .{
+                ipToString(u32ToIp(e.key_ptr.*), &ip_buf),
+                if (name_str.len > 0) " (" else "",
+                name_str,
+                if (name_str.len > 0) ")" else "",
+                formatLatency(@as(?u64, e.value_ptr.latest().?), &cur_buf),
+                formatLatency(@as(?u64, e.value_ptr.baseline().?), &base_buf),
+                e.value_ptr.count - 1,
+            }) catch {};
+            degraded_shown += 1;
+        }
+    }
+
+    // Machine-readable snapshots for the --http endpoint. Written by the
+    // main thread into buffers the HTTP server thread serves, so building
+    // them here can walk mesh state without any locking beyond the probe
+    // snapshot. Observers are keyed by node id (stable across renames);
+    // the observers array maps ids to human labels.
+
+    fn writeJsonStat(w: StdoutWriter, key: []const u8, v: ?u64) void {
+        if (v) |x| {
+            w.print("\"{s}\":{d}", .{ key, x }) catch {};
+        } else {
+            w.print("\"{s}\":null", .{key}) catch {};
+        }
+    }
+
+    pub fn writeJson(self: *Mesh, w: StdoutWriter) void {
+        const now = monotonicMicros();
+        var observers: [1 + max_peers]Observer = undefined;
+        const num_obs = self.collectObservers(&observers, now);
+        var rows = self.collectRows(observers[0..num_obs]);
+        defer rows.deinit(self.allocator);
+        const snap = self.snapshotProbes();
+
+        w.print("{{\"schema_version\":1,\"generated_at_unix_us\":{d},\"node_id\":\"{x:0>16}\",\"hostname\":", .{
+            common.wallMicros(), self.node_id,
+        }) catch {};
+        common.writeJsonString(w, self.hostname[0..self.hostname_len]);
+
+        w.writeAll(",\"observers\":[") catch {};
+        for (observers[0..num_obs], 0..) |*o, i| {
+            w.print("{s}{{\"id\":\"{x:0>16}\",\"label\":", .{ if (i == 0) "" else ",", o.node_id }) catch {};
+            common.writeJsonString(w, o.label());
+            w.writeAll(",") catch {};
+            writeJsonStat(w, "data_age_us", if (o.age_us >= 0) @intCast(o.age_us) else null);
+            w.writeAll("}") catch {};
+        }
+
+        w.writeAll("],\"hosts\":[") catch {};
+        for (rows.items, 0..) |ip, ri| {
+            var ip_buf: [16]u8 = undefined;
+            w.print("{s}{{\"ip\":\"{s}\",\"name\":", .{ if (ri == 0) "" else ",", ipToString(u32ToIp(ip), &ip_buf) }) catch {};
+            if (self.names.get(ip)) |ne| {
+                common.writeJsonString(w, ne.name());
+            } else {
+                w.writeAll("null") catch {};
+            }
+            const degraded = if (self.hist.getPtr(ip)) |h| h.degraded() else false;
+            w.print(",\"degraded\":{},\"by_observer\":{{", .{degraded}) catch {};
+            var first = true;
+            for (observers[0..num_obs]) |*o| {
+                const stats = o.hosts.get(ip) orelse continue;
+                w.print("{s}\"{x:0>16}\":{{", .{ if (first) "" else "," , o.node_id }) catch {};
+                first = false;
+                writeJsonStat(w, "min_us", statToOpt(stats.min_us));
+                w.writeAll(",") catch {};
+                writeJsonStat(w, "avg_us", statToOpt(stats.avg_us));
+                w.writeAll(",") catch {};
+                writeJsonStat(w, "max_us", statToOpt(stats.max_us));
+                w.writeAll(",") catch {};
+                writeJsonStat(w, "jitter_us", statToOpt(stats.jitter_us));
+                w.print(",\"loss_pct\":{d}}}", .{stats.loss_pct}) catch {};
+            }
+            w.writeAll("}}") catch {};
+        }
+
+        w.writeAll("],\"links\":[") catch {};
+        var lfirst = true;
+        for (observers[0..num_obs]) |*from| {
+            for (observers[0..num_obs]) |*to| {
+                if (from.node_id == to.node_id) continue;
+                const link = self.linkBetween(from, to.node_id, snap.peer_tcp[0..snap.peer_tcp_count]);
+                if (link.udp == null and link.tcp == null) continue;
+                w.print("{s}{{\"from\":\"{x:0>16}\",\"to\":\"{x:0>16}\",", .{
+                    if (lfirst) "" else ",", from.node_id, to.node_id,
+                }) catch {};
+                lfirst = false;
+                writeJsonStat(w, "udp_us", link.udp);
+                w.writeAll(",") catch {};
+                writeJsonStat(w, "tcp_us", link.tcp);
+                w.print(",\"tcp_refused\":{}}}", .{link.refused}) catch {};
+            }
+        }
+
+        w.writeAll("],\"tcp_targets\":[") catch {};
+        var keys: [max_target_keys]TargetKey = undefined;
+        const nk = self.collectTargetKeys(&snap, &keys);
+        for (keys[0..nk], 0..) |k, ki| {
+            var ip_buf: [16]u8 = undefined;
+            w.print("{s}{{\"ip\":\"{s}\",\"port\":{d},\"by_observer\":{{", .{
+                if (ki == 0) "" else ",", ipToString(u32ToIp(k.ip), &ip_buf), k.port,
+            }) catch {};
+            var tfirst = true;
+            for (observers[0..num_obs]) |*o| {
+                const seen = self.targetSeenBy(o, k, &snap);
+                const avg = seen.avg orelse continue;
+                w.print("{s}\"{x:0>16}\":{{\"tcp_us\":{d},\"refused\":{}}}", .{
+                    if (tfirst) "" else ",", o.node_id, avg, seen.refused,
+                }) catch {};
+                tfirst = false;
+            }
+            w.writeAll("}}") catch {};
+        }
+        w.writeAll("]}\n") catch {};
+    }
+
+    // Prometheus exposition format. Series are labeled by observer node id
+    // (stable across hostname changes); nlh_observer_info maps ids to
+    // labels. Values follow Prometheus convention: seconds, ratios.
+    fn writePromLabelValue(w: StdoutWriter, s: []const u8) void {
+        for (s) |ch| switch (ch) {
+            '\\' => w.writeAll("\\\\") catch {},
+            '"' => w.writeAll("\\\"") catch {},
+            '\n' => w.writeAll("\\n") catch {},
+            else => w.writeByte(ch) catch {},
+        };
+    }
+
+    fn promSeconds(us: u64) f64 {
+        return @as(f64, @floatFromInt(us)) / 1e6;
+    }
+
+    pub fn writeMetrics(self: *Mesh, w: StdoutWriter) void {
+        const now = monotonicMicros();
+        var observers: [1 + max_peers]Observer = undefined;
+        const num_obs = self.collectObservers(&observers, now);
+        var rows = self.collectRows(observers[0..num_obs]);
+        defer rows.deinit(self.allocator);
+        const snap = self.snapshotProbes();
+
+        w.print("# HELP nlh_peers Live mesh peers known to this node\n# TYPE nlh_peers gauge\nnlh_peers {d}\n", .{self.peers.items.len}) catch {};
+        w.print("# HELP nlh_hosts Hosts in the combined matrix\n# TYPE nlh_hosts gauge\nnlh_hosts {d}\n", .{rows.items.len}) catch {};
+
+        w.writeAll("# HELP nlh_observer_info Maps observer ids to their labels\n# TYPE nlh_observer_info gauge\n") catch {};
+        for (observers[0..num_obs]) |*o| {
+            w.print("nlh_observer_info{{id=\"{x:0>16}\",label=\"", .{o.node_id}) catch {};
+            writePromLabelValue(w, o.label());
+            w.writeAll("\"} 1\n") catch {};
+        }
+
+        w.writeAll("# HELP nlh_host_latency_seconds Host latency from an observer's vantage\n# TYPE nlh_host_latency_seconds gauge\n") catch {};
+        w.writeAll("# HELP nlh_host_loss_ratio Probe loss toward a host from an observer's vantage\n# TYPE nlh_host_loss_ratio gauge\n") catch {};
+        for (rows.items) |ip| {
+            var ip_buf: [16]u8 = undefined;
+            const ip_str = ipToString(u32ToIp(ip), &ip_buf);
+            for (observers[0..num_obs]) |*o| {
+                const stats = o.hosts.get(ip) orelse continue;
+                const stat_names = [_][]const u8{ "min", "avg", "max", "jitter" };
+                const stat_vals = [_]u32{ stats.min_us, stats.avg_us, stats.max_us, stats.jitter_us };
+                for (stat_names, stat_vals) |sn, sv| {
+                    if (sv == no_data) continue;
+                    w.print("nlh_host_latency_seconds{{ip=\"{s}\",observer=\"{x:0>16}\",stat=\"{s}\"}} {d}\n", .{
+                        ip_str, o.node_id, sn, promSeconds(sv),
+                    }) catch {};
+                }
+                w.print("nlh_host_loss_ratio{{ip=\"{s}\",observer=\"{x:0>16}\"}} {d}\n", .{
+                    ip_str, o.node_id, @as(f64, @floatFromInt(stats.loss_pct)) / 100.0,
+                }) catch {};
+            }
+        }
+
+        w.writeAll("# HELP nlh_link_seconds Node-to-node link latency (from -> to)\n# TYPE nlh_link_seconds gauge\n") catch {};
+        for (observers[0..num_obs]) |*from| {
+            for (observers[0..num_obs]) |*to| {
+                if (from.node_id == to.node_id) continue;
+                const link = self.linkBetween(from, to.node_id, snap.peer_tcp[0..snap.peer_tcp_count]);
+                if (link.udp) |v| {
+                    w.print("nlh_link_seconds{{from=\"{x:0>16}\",to=\"{x:0>16}\",transport=\"udp\"}} {d}\n", .{ from.node_id, to.node_id, promSeconds(v) }) catch {};
+                }
+                if (link.tcp) |v| {
+                    w.print("nlh_link_seconds{{from=\"{x:0>16}\",to=\"{x:0>16}\",transport=\"tcp\"}} {d}\n", .{ from.node_id, to.node_id, promSeconds(v) }) catch {};
+                }
+            }
+        }
+
+        w.writeAll("# HELP nlh_tcp_target_seconds TCP connect latency to a --tcp-ping target\n# TYPE nlh_tcp_target_seconds gauge\n") catch {};
+        var keys: [max_target_keys]TargetKey = undefined;
+        const nk = self.collectTargetKeys(&snap, &keys);
+        for (keys[0..nk]) |k| {
+            var ip_buf: [16]u8 = undefined;
+            const ip_str = ipToString(u32ToIp(k.ip), &ip_buf);
+            for (observers[0..num_obs]) |*o| {
+                const seen = self.targetSeenBy(o, k, &snap);
+                const avg = seen.avg orelse continue;
+                w.print("nlh_tcp_target_seconds{{ip=\"{s}\",port=\"{d}\",observer=\"{x:0>16}\"}} {d}\n", .{
+                    ip_str, k.port, o.node_id, promSeconds(avg),
+                }) catch {};
+            }
+        }
     }
 };
 
@@ -1505,8 +1915,8 @@ test "beacon encode truncates an oversized hostname" {
 
 test "results chunk round-trips including the no-data sentinel" {
     const entries = [_]Entry{
-        .{ .ip = ipToU32(.{ 192, 168, 1, 1 }), .stats = .{ .min_us = 100, .avg_us = 250, .max_us = 900 } },
-        .{ .ip = ipToU32(.{ 192, 168, 1, 7 }), .stats = .{ .min_us = no_data, .avg_us = no_data, .max_us = no_data } },
+        .{ .ip = ipToU32(.{ 192, 168, 1, 1 }), .stats = .{ .min_us = 100, .avg_us = 250, .max_us = 900, .jitter_us = 42, .loss_pct = 20 } },
+        .{ .ip = ipToU32(.{ 192, 168, 1, 7 }), .stats = .{ .min_us = no_data, .avg_us = no_data, .max_us = no_data, .jitter_us = no_data, .loss_pct = 100 } },
     };
     var buf: [results_fixed_len + entries_per_chunk * entry_len]u8 = undefined;
     const msg = encodeResultsChunk(&buf, 99, 3, 10, 4, &entries);
@@ -1520,11 +1930,20 @@ test "results chunk round-trips including the no-data sentinel" {
     const e0 = decodeEntry(parsed.results.entries[0..entry_len]);
     try testing.expectEqual(entries[0].ip, e0.ip);
     try testing.expectEqual(@as(u32, 250), e0.stats.avg_us);
+    try testing.expectEqual(@as(u32, 42), e0.stats.jitter_us);
+    try testing.expectEqual(@as(u8, 20), e0.stats.loss_pct);
     try testing.expect(e0.stats.hasData());
 
     const e1 = decodeEntry(parsed.results.entries[entry_len .. 2 * entry_len]);
     try testing.expectEqual(entries[1].ip, e1.ip);
+    try testing.expectEqual(@as(u8, 100), e1.stats.loss_pct);
     try testing.expect(!e1.stats.hasData());
+}
+
+test "decodeEntry clamps a loss percentage over 100" {
+    var bytes: [entry_len]u8 = @splat(0);
+    bytes[20] = 250; // forged loss byte
+    try testing.expectEqual(@as(u8, 100), decodeEntry(&bytes).stats.loss_pct);
 }
 
 test "ping and pong round-trip through encode and parse" {
@@ -1605,9 +2024,9 @@ test "parseMessage rejects malformed datagrams" {
     // Too short for any header
     try testing.expect(parseMessage(&.{ 'N', 'L', 'H' }) == null);
 
-    // Wrong magic/version
+    // Wrong magic/version (NLH1 is the previous protocol version)
     var bad_magic: [beacon_fixed_len]u8 = @splat(0);
-    @memcpy(bad_magic[0..4], "NLH2");
+    @memcpy(bad_magic[0..4], "NLH1");
     bad_magic[4] = 1;
     try testing.expect(parseMessage(&bad_magic) == null);
 
@@ -1656,9 +2075,130 @@ test "spreadIsUneven requires both ratio and absolute gap" {
     try testing.expect(!spreadIsUneven(500, 500)); // identical
 }
 
+test "HostHistory needs history before calling a trend" {
+    var h = HostHistory{};
+    try testing.expectEqual(@as(?u32, null), h.latest());
+    try testing.expectEqual(@as(?u32, null), h.baseline());
+    try testing.expect(!h.degraded());
+
+    h.push(1000);
+    h.push(1200);
+    h.push(50000); // a spike with too little history is not a trend
+    try testing.expectEqual(@as(?u32, 50000), h.latest());
+    try testing.expect(!h.degraded());
+}
+
+test "HostHistory flags a degradation against the median baseline" {
+    var h = HostHistory{};
+    h.push(1000);
+    h.push(1100);
+    h.push(900);
+    h.push(1000);
+    try testing.expect(!h.degraded());
+    try testing.expectEqual(@as(?u32, 1000), h.baseline());
+
+    h.push(40000); // 40x the baseline, gap far beyond jitter
+    try testing.expect(h.degraded());
+    try testing.expectEqual(@as(?u32, 40000), h.latest());
+
+    // A recovery clears the flag; the earlier spike can't fake a baseline
+    h.push(1000);
+    try testing.expect(!h.degraded());
+}
+
+test "HostHistory ring wraps without losing the newest sample" {
+    var h = HostHistory{};
+    for (0..history_len * 2) |i| h.push(@intCast(100 + i));
+    try testing.expectEqual(@as(u8, history_len), h.count);
+    try testing.expectEqual(@as(?u32, 100 + history_len * 2 - 1), h.latest());
+}
+
 test "medianOfSorted picks the middle element" {
     try testing.expectEqual(@as(?u64, null), medianOfSorted(&.{}));
     try testing.expectEqual(@as(?u64, 5), medianOfSorted(&.{5}));
     try testing.expectEqual(@as(?u64, 7), medianOfSorted(&.{ 1, 7, 9 }));
     try testing.expectEqual(@as(?u64, 8), medianOfSorted(&.{ 1, 7, 8, 9 }));
+}
+
+test "sealed messages round-trip through open and parse" {
+    const key = deriveKey("swordfish");
+    var msg_buf: [beacon_fixed_len + max_hostname]u8 = undefined;
+    const msg = encodeBeacon(&msg_buf, 42, 7, 3, "office-nas");
+
+    var sealed_buf: [recv_buf_len]u8 = undefined;
+    var wire: [recv_buf_len]u8 = undefined;
+    const sealed = sealMessage(&key, msg, &sealed_buf);
+    try testing.expectEqual(msg.len + mac_len, sealed.len);
+    try testing.expectEqualSlices(u8, &secured_magic, sealed[0..4]);
+
+    // A sealed message must NOT parse as the plain protocol
+    try testing.expect(parseMessage(sealed) == null);
+
+    @memcpy(wire[0..sealed.len], sealed);
+    const opened = openMessage(&key, wire[0..sealed.len]).?;
+    const parsed = parseMessage(opened).?;
+    try testing.expectEqual(@as(u64, 42), parsed.beacon.node_id);
+    try testing.expectEqualStrings("office-nas", parsed.beacon.hostname);
+}
+
+test "openMessage rejects tampering, wrong keys, and unauthenticated traffic" {
+    const key = deriveKey("swordfish");
+    var msg_buf: [beacon_fixed_len + max_hostname]u8 = undefined;
+    const msg = encodeBeacon(&msg_buf, 42, 7, 3, "office-nas");
+    var sealed_buf: [recv_buf_len]u8 = undefined;
+    const sealed = sealMessage(&key, msg, &sealed_buf);
+
+    var wire: [recv_buf_len]u8 = undefined;
+
+    // Flipped body byte
+    @memcpy(wire[0..sealed.len], sealed);
+    wire[header_len] ^= 1;
+    try testing.expect(openMessage(&key, wire[0..sealed.len]) == null);
+
+    // Flipped tag byte
+    @memcpy(wire[0..sealed.len], sealed);
+    wire[sealed.len - 1] ^= 1;
+    try testing.expect(openMessage(&key, wire[0..sealed.len]) == null);
+
+    // Wrong key
+    const other = deriveKey("marlin");
+    @memcpy(wire[0..sealed.len], sealed);
+    try testing.expect(openMessage(&other, wire[0..sealed.len]) == null);
+
+    // Unauthenticated plain-protocol datagram
+    @memcpy(wire[0..msg.len], msg);
+    try testing.expect(openMessage(&key, wire[0..msg.len]) == null);
+
+    // Too short to even carry a tag
+    try testing.expect(openMessage(&key, wire[0..header_len]) == null);
+}
+
+// Fuzz the datagram parser: it eats untrusted broadcast traffic, so no
+// input may crash it or make a parsed view exceed its buffer. Seeding the
+// real magic into some inputs lets the fuzzer reach the per-type parsing
+// instead of bouncing off the magic check.
+fn fuzzParseMessage(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [recv_buf_len]u8 = undefined;
+    const len = smith.slice(&buf);
+    if (len >= 5 and smith.value(bool)) {
+        @memcpy(buf[0..4], &protocol_magic);
+        if (smith.value(bool)) buf[4] = smith.valueRangeAtMost(u8, 1, 5);
+    }
+    const parsed = parseMessage(buf[0..len]) orelse return;
+    switch (parsed) {
+        .beacon => |b| try testing.expect(b.hostname.len <= max_hostname),
+        .results => |r| {
+            try testing.expect(r.entries.len % entry_len == 0);
+            try testing.expect(r.entries.len / entry_len <= entries_per_chunk);
+        },
+        .links => |l| {
+            try testing.expect(l.link_bytes.len % link_entry_len == 0);
+            try testing.expect(l.target_bytes.len % target_entry_len == 0);
+        },
+        .ping, .pong => {},
+    }
+}
+
+test "fuzz parseMessage on arbitrary datagrams" {
+    try std.testing.fuzz({}, fuzzParseMessage, .{});
 }

@@ -10,6 +10,11 @@ A fast network scanner that discovers hosts on your network and measures their l
 - **Two-phase scanning**: Fast discovery phase followed by accurate latency measurement
 - **Kernel receive timestamps**: Uses `SO_TIMESTAMP` on Linux and macOS so replies are stamped by the kernel on arrival — process wakeup and scheduling delay don't inflate measured RTTs (falls back to userspace timestamps where unavailable, including on Windows)
 - **Monotonic timing**: All pacing, timeouts, and fallback measurements use `CLOCK_MONOTONIC` (`QueryPerformanceCounter` on Windows); kernel stamps (wall clock only) are cross-checked against a monotonic upper bound, so an NTP step or slew mid-scan can't corrupt samples or stall the scanner
+- **Packet loss and jitter**: Every host reports probes sent vs answered and the standard deviation of its samples (ping's mdev) alongside min/avg/max — an average computed only from surviving probes understates a lossy or jittery link, so loss is flagged right in the heatmap cells
+- **Reverse-DNS names**: Discovered hosts are named through the system resolver after each scan (mDNS/NetBIOS too, wherever the OS consults them), under a soft time budget so slow DNS can't stall scanning (`--no-names` to disable)
+- **Machine-readable output**: `--json` turns a one-shot scan into a single JSON document; in mesh mode `--http` serves the live matrix as JSON and Prometheus metrics for Grafana or scripts
+- **Trend detection**: Mesh mode keeps a rolling history of scan averages per host and calls out hosts that just degraded versus their own recent baseline
+- **Authenticated mesh**: `--mesh-key` HMAC-tags every mesh datagram so only nodes sharing the key can join or inject results
 - **Visual heatmap**: Color-coded latency display to quickly identify slow devices
 - **Flicker-free live view**: the mesh matrix never clears the screen between frames — each redraw overwrites the previous frame in place (erasing only stale line tails and leftover rows), is emitted as a single write, and is wrapped in terminal synchronized output (mode 2026) so capable terminals commit it atomically
 - **Concurrent scanning**: Uses separate sender/receiver threads for maximum throughput
@@ -24,7 +29,13 @@ A fast network scanner that discovers hosts on your network and measures their l
 
 - macOS/BSD (kqueue), Linux (epoll), or Windows 10+ (Winsock2) — uses raw ICMP sockets
 - Elevated privileges for raw socket access: root/sudo on macOS and Linux, an Administrator prompt on Windows
-- Zig 0.16+
+- Zig 0.16+ (only for building from source — tagged releases ship prebuilt binaries for x86_64/aarch64 Linux, macOS, and Windows)
+
+IPv4 only for now: every address path in the scanner, the mesh protocol, and the display is v4. ICMPv6 + multicast discovery is a planned follow-up, tracked separately because it touches every module.
+
+## Installing
+
+Prebuilt binaries for x86_64/aarch64 Linux, macOS, and Windows are attached to every [tagged release](https://github.com/jmmoser/NetworkLatencyHeatmap/releases) (with a `SHA256SUMS` file) — mesh mode is most useful when it's trivial to drop the binary on a Pi, a NAS, and a laptop at once.
 
 ## Building
 
@@ -76,6 +87,12 @@ sudo ./zig-out/bin/latency-heatmap --mesh
 
 # Mesh mode, also TCP-pinging the router's web UI and an SSH server
 sudo ./zig-out/bin/latency-heatmap --mesh --tcp-ping 192.168.1.1:443 --tcp-ping 192.168.1.10:22
+
+# One-shot scan as JSON, piped into jq
+sudo ./zig-out/bin/latency-heatmap --json 192.168.1.0/24 | jq '.hosts[] | select(.loss_pct > 0)'
+
+# Authenticated mesh node also serving JSON + Prometheus metrics on :9464
+sudo ./zig-out/bin/latency-heatmap --mesh --mesh-key hunter2 --http 9464
 ```
 
 ### Options
@@ -89,6 +106,10 @@ sudo ./zig-out/bin/latency-heatmap --mesh --tcp-ping 192.168.1.1:443 --tcp-ping 
 | `--mesh-port <port>` | UDP+TCP port for mesh discovery, gossip, and node-to-node probes | 47269 |
 | `-i <sec>` | Mesh mode: rescan interval in seconds (0 = scan once) | 60 |
 | `--tcp-ping <ip:port>` | Mesh mode: TCP-ping this host on a known port (repeatable, up to 16) | none |
+| `--json` | One-shot scan: print a single JSON document on stdout instead of the heatmap | off |
+| `--http <port>` | Mesh mode: serve `/json` and `/metrics` (Prometheus) over HTTP | off |
+| `--mesh-key <secret>` | Mesh mode: HMAC-authenticate every mesh datagram; all nodes need the same secret | off |
+| `--no-names` | Skip reverse-DNS lookups of discovered hosts | resolve |
 | `--no-color` | Disable colored output (also off when stdout is not a terminal or `NO_COLOR` is set) | |
 | `-h, --help` | Show help message | |
 
@@ -110,11 +131,42 @@ sudo ./zig-out/bin/latency-heatmap --mesh --tcp-ping 192.168.1.1:443 --tcp-ping 
 2. **Phase 2: Latency Measurement**
    - For each discovered host, sends multiple pings
    - On Linux and macOS, reply arrival times come from kernel timestamps (`SCM_TIMESTAMP`), not userspace clocks, so scheduling jitter is excluded from the samples; Windows has no equivalent, so samples there use monotonic userspace timestamps taken at poll wakeup
-   - Records min/avg/max latency for each host
+   - Records min/avg/max latency, jitter (standard deviation, ping's mdev), and probes sent vs answered for each host — a host that answers discovery but drops latency probes shows up as loss, not as a healthy average
    - The early-exit silence window scales with the slowest RTT observed so far, so replies from high-latency hosts still in flight aren't clipped by a burst of fast responders finishing first
-   - Displays results with color-coded heatmap
+   - Resolves reverse-DNS names for the discovered hosts through the system resolver (a small worker pool with a soft time budget, so an unresponsive DNS server costs seconds, not minutes)
+   - Displays results with color-coded heatmap; cells with dropped probes carry a red `!N%` loss marker
 
 The phases are deliberately sequential: latency is measured in a quiet window after the discovery blast, so probes never compete with the scanner's own traffic for the NIC and socket buffers.
+
+## Machine-Readable Output
+
+### One-shot scans: `--json`
+
+`--json` suppresses all decoration and progress and prints exactly one JSON document on stdout:
+
+```json
+{
+  "schema_version": 1,
+  "scanned_at_unix_us": 1788143705607332,
+  "subnet": "192.168.1.0/24",
+  "pings_per_host": 5,
+  "hosts": [
+    { "ip": "192.168.1.1", "name": "router.lan", "min_us": 610, "avg_us": 640,
+      "max_us": 702, "jitter_us": 31, "sent": 5, "received": 5, "loss_pct": 0 }
+  ]
+}
+```
+
+Latency fields are integers in microseconds, `null` where the host produced no sample (a host with `loss_pct: 100` answered discovery but none of the latency probes — exactly the hosts worth noticing).
+
+### Mesh mode: `--http <port>`
+
+Any mesh node can serve its converged view over HTTP:
+
+- `/json` — the full snapshot: observers, the host matrix (min/avg/max/jitter/loss from every vantage), degradation flags, node-to-node links, and TCP targets
+- `/metrics` — Prometheus exposition format (`nlh_host_latency_seconds`, `nlh_host_loss_ratio`, `nlh_link_seconds`, `nlh_tcp_target_seconds`, ...), ready to scrape into Grafana; series are keyed by stable node ids, and `nlh_observer_info` maps ids to labels
+
+The server thread only ever serves byte snapshots the main thread refreshes every two seconds — a slow or hostile client can never stall probing, gossip, or rendering. Requests are GET-only with bounded reads and deadlines. The endpoint binds all interfaces (it's a LAN tool) and is opt-in; don't expose it past your LAN.
 
 ## Mesh Mode
 
@@ -147,10 +199,20 @@ Comparing the same host from multiple vantage points localizes problems a single
 - A host slow from **every** observer is itself the problem (slow radio, power-saving NIC, overload)
 - A host slow from **some** observers (`◀ uneven`) points at a link, switch, or AP between network segments
 - An observer that measures **everything** slow has a bad uplink of its own — the insight section calls this out
+- A cell marked `!` is dropping ≥20% of probes from that vantage — a host can average fast while losing packets (radio interference, power saving, overload); the insights section counts these
+- A host whose average jumped to ≥3x its own median over the previous scans is flagged as **degraded** — the rescan loop keeps a 16-scan history per host, so a fresh problem is distinguishable from a device that has always been slow
+
+Rows scanned by this node also show their reverse-DNS names; names aren't gossiped (every node asks the same resolver anyway), so rows only peers scanned appear as bare IPs.
 
 How it works: each node broadcasts a small UDP beacon every 2 seconds to announce itself, and gossips its scan results (chunked to fit under the MTU) every 5 seconds plus immediately to newly joined peers. There is no coordinator — every node converges on the full matrix and renders it live. By default each node rescans every 60 seconds (`-i` changes this; `-i 0` scans once and keeps sharing). Mesh traffic is deliberately phase-separated from measurement: while a scan runs, only the tiny beacons keep flowing (so a long scan doesn't get the node dropped from its peers' tables, and incoming datagrams keep being drained), while result gossip is deferred until the scan completes — the mesh never competes with its own probes.
 
-Incoming datagrams are treated as untrusted input: fixed caps on peers and hosts, strict length validation, and anything malformed or from a different protocol version is dropped silently.
+Incoming datagrams are treated as untrusted input: fixed caps on peers and hosts, strict length validation, and anything malformed or from a different protocol version is dropped silently. The parser is additionally covered by a fuzz test (`zig build test --fuzz` exercises it continuously).
+
+### Mesh authentication: `--mesh-key`
+
+By default anyone on the LAN can join the mesh and inject results. With `--mesh-key <secret>` (the same secret on every node), each datagram carries a truncated HMAC-SHA256 tag and everything unauthenticated is dropped. Keyed meshes speak under their own protocol magic, so a keyed and an unkeyed mesh on one LAN ignore each other cleanly rather than half-seeing each other.
+
+Scope, honestly stated: this authenticates and integrity-protects. It does **not** encrypt (measurements are readable on the wire) and does not prevent replay of captured datagrams — it keeps casual injection and accidental cross-talk out, not a determined on-LAN attacker.
 
 ### Node-to-node TCP and UDP pings
 
@@ -213,9 +275,9 @@ Active Devices:
 
 ## Use Cases
 
-- **Network troubleshooting**: Find hosts that are slow to respond
-- **Network inventory**: Quick discovery of all active devices on a subnet
-- **Performance monitoring**: Track latency to critical infrastructure
+- **Network troubleshooting**: Find hosts that are slow, lossy, or jittery — and whether they just became so
+- **Network inventory**: Quick discovery of all active devices on a subnet, with names
+- **Performance monitoring**: Leave mesh nodes running with `--http` and scrape them into Prometheus/Grafana; or script one-shot `--json` scans
 
 ## License
 
