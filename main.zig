@@ -6,6 +6,7 @@ const common = @import("common.zig");
 const mesh_mod = @import("mesh.zig");
 const probe = @import("probe.zig");
 const plat = @import("plat.zig");
+const httpd = @import("httpd.zig");
 
 const SocketPoller = common.SocketPoller;
 const PingResult = common.PingResult;
@@ -309,6 +310,7 @@ const Config = struct {
     rescan_interval_s: u32 = 60, // Mesh mode: seconds between scans, 0 = scan once
     resolve_names: bool = true, // Reverse-DNS discovered hosts (--no-names)
     json: bool = false, // One-shot scan: emit JSON instead of the heatmap
+    http_port: u16 = 0, // Mesh mode: serve /json + /metrics (0 = off)
 
     // Extra TCP ping targets (--tcp-ping ip:port): hosts that aren't running
     // this tool but answer a SYN on a known port with SYN-ACK or RST
@@ -1415,6 +1417,21 @@ fn runMeshMode(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
         scanner.tick_ctx = null;
     }
 
+    // Optional HTTP endpoint: the server thread serves byte snapshots that
+    // this loop refreshes; it never touches mesh state itself
+    var http_server: ?httpd.Server = null;
+    defer if (http_server) |*srv| srv.deinit();
+    if (config.http_port != 0) {
+        http_server = httpd.Server.init(allocator, config.http_port) catch |err| {
+            std.debug.print("Error: failed to open HTTP endpoint on port {d}: {s}\n", .{ config.http_port, @errorName(err) });
+            return err;
+        };
+        try http_server.?.start();
+        stdout.print("  HTTP endpoint on port {d}: /json, /metrics\n", .{config.http_port}) catch {};
+    }
+    const snapshot_interval_us: i64 = 2 * std.time.us_per_s;
+    var next_snapshot_at: i64 = 0;
+
     const rescan_us: i64 = @as(i64, config.rescan_interval_s) * std.time.us_per_s;
     var next_scan_at: i64 = monotonicMicros(); // first scan runs immediately
 
@@ -1431,6 +1448,21 @@ fn runMeshMode(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
         }
         mesh.pump();
         mesh.renderIfDue(stdout, if (rescan_us > 0) next_scan_at else null);
+
+        if (http_server) |*srv| {
+            const snap_now = monotonicMicros();
+            if (snap_now >= next_snapshot_at and mesh.local_scan_us > 0) {
+                next_snapshot_at = snap_now + snapshot_interval_us;
+                var jw = std.Io.Writer.Allocating.init(allocator);
+                defer jw.deinit();
+                var mw = std.Io.Writer.Allocating.init(allocator);
+                defer mw.deinit();
+                mesh.writeJson(&jw.writer);
+                mesh.writeMetrics(&mw.writer);
+                srv.setSnapshots(jw.writer.buffered(), mw.writer.buffered());
+            }
+        }
+
         // Sleep until mesh traffic arrives or a short tick elapses
         _ = mesh.poller.wait(100);
     }
@@ -1502,6 +1534,9 @@ pub fn main(init: std.process.Init) !void {
                 \\              port (SYN→SYN-ACK, or RST from a closed port — both time
                 \\              the host's stack). Works on devices not running this
                 \\              tool; repeatable, up to 16 targets
+                \\  --http <port>  Mesh mode: serve the live mesh state over HTTP —
+                \\              /json (full snapshot) and /metrics (Prometheus) — so
+                \\              Grafana or scripts can scrape any node
                 \\  --json      One-shot scan: print results as a JSON document on
                 \\              stdout (progress and decoration are suppressed);
                 \\              not applicable to --mesh, which serves --http instead
@@ -1558,6 +1593,11 @@ pub fn main(init: std.process.Init) !void {
             config.mesh_port = std.fmt.parseInt(u16, value, 10) catch
                 return invalidArgValue("--mesh-port", value);
             if (config.mesh_port == 0) return invalidArgValue("--mesh-port", value);
+        } else if (std.mem.eql(u8, arg, "--http")) {
+            const value = nextArgValue(args, &i);
+            config.http_port = std.fmt.parseInt(u16, value, 10) catch
+                return invalidArgValue("--http", value);
+            if (config.http_port == 0) return invalidArgValue("--http", value);
         } else if (std.mem.eql(u8, arg, "-i")) {
             const value = nextArgValue(args, &i);
             config.rescan_interval_s = std.fmt.parseInt(u32, value, 10) catch
@@ -1592,6 +1632,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (config.json and config.mesh) {
         std.debug.print("Error: --json is for one-shot scans; mesh mode serves machine-readable output over --http\n", .{});
+        std.process.exit(1);
+    }
+    if (config.http_port != 0 and !config.mesh) {
+        std.debug.print("Error: --http serves the mesh matrix; add --mesh (one-shot scans have --json)\n", .{});
         std.process.exit(1);
     }
 
@@ -1707,6 +1751,7 @@ test {
     _ = @import("mesh.zig");
     _ = @import("probe.zig");
     _ = @import("plat.zig");
+    _ = @import("httpd.zig");
 }
 
 test "calculateChecksum verifies to zero over a packet containing its own checksum" {

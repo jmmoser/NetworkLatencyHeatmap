@@ -55,6 +55,8 @@ pub const win = struct {
     pub extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: ?*const anyopaque, optlen: c_int) callconv(.winapi) c_int;
     pub extern "ws2_32" fn sendto(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int, to: *const anyopaque, tolen: c_int) callconv(.winapi) c_int;
     pub extern "ws2_32" fn recvfrom(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int, from: ?*anyopaque, fromlen: ?*c_int) callconv(.winapi) c_int;
+    pub extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+    pub extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
     pub extern "ws2_32" fn ioctlsocket(s: SOCKET, cmd: c_long, argp: *c_ulong) callconv(.winapi) c_int;
     pub extern "ws2_32" fn WSAPoll(fdArray: [*]WSAPOLLFD, fds: c_ulong, timeout: c_int) callconv(.winapi) c_int;
     pub extern "ws2_32" fn WSAIoctl(s: SOCKET, dwIoControlCode: u32, lpvInBuffer: ?*const anyopaque, cbInBuffer: u32, lpvOutBuffer: ?*anyopaque, cbOutBuffer: u32, lpcbBytesReturned: *u32, lpOverlapped: ?*anyopaque, lpCompletionRoutine: ?*anyopaque) callconv(.winapi) c_int;
@@ -309,6 +311,22 @@ pub fn recvfrom(s: Socket, buf: []u8, addr: ?*anyopaque, addr_len: ?*u32) isize 
         return rc;
     } else {
         return c.recvfrom(s, buf.ptr, buf.len, 0, @ptrCast(@alignCast(addr)), @ptrCast(@alignCast(addr_len)));
+    }
+}
+
+pub fn send(s: Socket, buf: []const u8) isize {
+    if (is_windows) {
+        return win.send(s, buf.ptr, @intCast(buf.len), 0);
+    } else {
+        return c.send(s, buf.ptr, buf.len, 0);
+    }
+}
+
+pub fn recv(s: Socket, buf: []u8) isize {
+    if (is_windows) {
+        return win.recv(s, buf.ptr, @intCast(buf.len), 0);
+    } else {
+        return c.recv(s, buf.ptr, buf.len, 0);
     }
 }
 

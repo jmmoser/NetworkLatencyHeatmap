@@ -475,22 +475,7 @@ const PeerTcp = struct {
     stats: probe.ProbeStats,
 };
 
-// Minimal blocking lock for the prober handoff: the critical sections copy
-// a few hundred bytes and contention is one thread every few seconds, so
-// spinning with a scheduler yield is plenty. (Zig 0.16's std has no plain
-// blocking thread mutex — std.Io.Mutex wants an Io instance this module
-// doesn't carry.)
-const SpinLock = struct {
-    inner: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *SpinLock) void {
-        while (!self.inner.tryLock()) std.Thread.yield() catch {};
-    }
-
-    fn unlock(self: *SpinLock) void {
-        self.inner.unlock();
-    }
-};
+const SpinLock = common.SpinLock;
 
 // Everything the prober thread and the main thread exchange, under one
 // mutex: the main thread refreshes the peer snapshot each pump and reads
@@ -1187,6 +1172,108 @@ pub const Mesh = struct {
         return o;
     }
 
+    // Assemble the observer columns: self first, then live peers
+    fn collectObservers(self: *Mesh, observers: *[1 + max_peers]Observer, now: i64) usize {
+        observers[0] = makeObserver("self", self.node_id, &self.local_hosts, if (self.local_scan_us > 0) now - self.local_scan_us else -1);
+        var num_obs: usize = 1;
+        for (self.peers.items) |*p| {
+            if (num_obs >= observers.len) break;
+            var ip_buf: [16]u8 = undefined;
+            const peer_ip: [4]u8 = @bitCast(p.addr.addr);
+            const label_text = if (p.hostname_len > 0) p.name() else ipToString(peer_ip, &ip_buf);
+            const age: i64 = if (p.last_results_us > 0) now - p.last_results_us else -1;
+            observers[num_obs] = makeObserver(label_text, p.node_id, &p.hosts, age);
+            num_obs += 1;
+        }
+        return num_obs;
+    }
+
+    // Row set: every host any observer has measured, sorted by IP
+    fn collectRows(self: *Mesh, observers: []const Observer) std.ArrayList(u32) {
+        var row_set = std.AutoHashMap(u32, void).init(self.allocator);
+        defer row_set.deinit();
+        for (observers) |*o| {
+            var it = o.hosts.keyIterator();
+            while (it.next()) |k| row_set.put(k.*, {}) catch {};
+        }
+        var rows: std.ArrayList(u32) = .empty;
+        var kit = row_set.keyIterator();
+        while (kit.next()) |k| rows.append(self.allocator, k.*) catch {};
+        std.mem.sort(u32, rows.items, {}, std.sort.asc(u32));
+        return rows;
+    }
+
+    // One consistent copy of the prober thread's results, taken under the
+    // lock so rendering and snapshot building can work unlocked
+    const ProbeSnapshot = struct {
+        peer_tcp: [max_peers]PeerTcp,
+        peer_tcp_count: usize,
+        extras: [probe.max_targets]probe.TcpTarget,
+        extra_tcp: [probe.max_targets]probe.ProbeStats,
+        extra_count: usize,
+    };
+
+    fn snapshotProbes(self: *Mesh) ProbeSnapshot {
+        var snap: ProbeSnapshot = undefined;
+        self.probes.mutex.lock();
+        defer self.probes.mutex.unlock();
+        snap.peer_tcp_count = self.probes.peer_tcp_count;
+        @memcpy(snap.peer_tcp[0..snap.peer_tcp_count], self.probes.peer_tcp[0..snap.peer_tcp_count]);
+        snap.extra_count = self.probes.extra_count;
+        @memcpy(snap.extras[0..snap.extra_count], self.probes.extras[0..snap.extra_count]);
+        @memcpy(snap.extra_tcp[0..snap.extra_count], self.probes.extra_tcp[0..snap.extra_count]);
+        return snap;
+    }
+
+    // Union of TCP targets: ours plus everything peers gossip
+    const TargetKey = struct { ip: u32, port: u16 };
+    const max_target_keys = 32;
+
+    fn collectTargetKeys(self: *Mesh, snap: *const ProbeSnapshot, keys: *[max_target_keys]TargetKey) usize {
+        var n: usize = 0;
+        for (snap.extras[0..snap.extra_count]) |t| {
+            if (n >= keys.len) break;
+            keys[n] = .{ .ip = ipToU32(t.ip), .port = t.port };
+            n += 1;
+        }
+        outer: for (self.peers.items) |*p| {
+            for (p.remote_targets[0..p.remote_target_count]) |e| {
+                if (n >= keys.len) break :outer;
+                var seen = false;
+                for (keys[0..n]) |k| {
+                    if (k.ip == e.ip and k.port == e.port) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    keys[n] = .{ .ip = e.ip, .port = e.port };
+                    n += 1;
+                }
+            }
+        }
+        return n;
+    }
+
+    // How `observer` sees TCP target ip:port — our own probe stats when the
+    // observer is us, the peer's gossiped snapshot otherwise
+    fn targetSeenBy(self: *Mesh, o: *const Observer, key: TargetKey, snap: *const ProbeSnapshot) struct { avg: ?u64, refused: bool } {
+        if (o.node_id == self.node_id) {
+            for (snap.extras[0..snap.extra_count], 0..) |t, i| {
+                if (ipToU32(t.ip) == key.ip and t.port == key.port and snap.extra_tcp[i].alive()) {
+                    return .{ .avg = snap.extra_tcp[i].avg(), .refused = snap.extra_tcp[i].refused };
+                }
+            }
+            return .{ .avg = null, .refused = false };
+        }
+        if (self.findPeer(o.node_id)) |p| {
+            if (p.targetStats(key.ip, key.port)) |e| {
+                return .{ .avg = statToOpt(e.tcp_avg), .refused = e.refused };
+            }
+        }
+        return .{ .avg = null, .refused = false };
+    }
+
     fn render(self: *Mesh, stdout: StdoutWriter, now: i64, next_scan_at: ?i64) void {
         const reset = common.sgr("\x1b[0m");
         const bold = common.sgr("\x1b[1m");
@@ -1197,34 +1284,12 @@ pub const Mesh = struct {
         const label_width = 17;
         const pad = " " ** 32;
 
-        // Assemble the observer columns: self first, then live peers
         var observers: [1 + max_peers]Observer = undefined;
-        var num_obs: usize = 0;
-        observers[0] = makeObserver("self", self.node_id, &self.local_hosts, if (self.local_scan_us > 0) now - self.local_scan_us else -1);
-        num_obs = 1;
-        for (self.peers.items) |*p| {
-            if (num_obs >= observers.len) break;
-            var ip_buf: [16]u8 = undefined;
-            const peer_ip: [4]u8 = @bitCast(p.addr.addr);
-            const label_text = if (p.hostname_len > 0) p.name() else ipToString(peer_ip, &ip_buf);
-            const age: i64 = if (p.last_results_us > 0) now - p.last_results_us else -1;
-            observers[num_obs] = makeObserver(label_text, p.node_id, &p.hosts, age);
-            num_obs += 1;
-        }
+        const num_obs = self.collectObservers(&observers, now);
         const shown_obs = @min(num_obs, max_display_observers);
 
-        // Row set: every host any observer has measured
-        var row_set = std.AutoHashMap(u32, void).init(self.allocator);
-        defer row_set.deinit();
-        for (observers[0..num_obs]) |*o| {
-            var it = o.hosts.keyIterator();
-            while (it.next()) |k| row_set.put(k.*, {}) catch {};
-        }
-        var rows: std.ArrayList(u32) = .empty;
+        var rows = self.collectRows(observers[0..num_obs]);
         defer rows.deinit(self.allocator);
-        var kit = row_set.keyIterator();
-        while (kit.next()) |k| rows.append(self.allocator, k.*) catch {};
-        std.mem.sort(u32, rows.items, {}, std.sort.asc(u32));
 
         // Redraw from the top; the matrix is a live view, not a log. When
         // output is piped there is no screen to clear — each render is
@@ -1375,47 +1440,11 @@ pub const Mesh = struct {
         const label_width = 17;
         const pad = " " ** 32;
 
-        // Copy the prober's results out under the lock; render unlocked
-        var peer_tcp: [max_peers]PeerTcp = undefined;
-        var peer_tcp_count: usize = 0;
-        var extras: [probe.max_targets]probe.TcpTarget = undefined;
-        var extra_tcp: [probe.max_targets]probe.ProbeStats = undefined;
-        var extra_count: usize = 0;
-        {
-            self.probes.mutex.lock();
-            defer self.probes.mutex.unlock();
-            peer_tcp_count = self.probes.peer_tcp_count;
-            @memcpy(peer_tcp[0..peer_tcp_count], self.probes.peer_tcp[0..peer_tcp_count]);
-            extra_count = self.probes.extra_count;
-            @memcpy(extras[0..extra_count], self.probes.extras[0..extra_count]);
-            @memcpy(extra_tcp[0..extra_count], self.probes.extra_tcp[0..extra_count]);
-        }
+        // One consistent copy of the prober's results; render unlocked
+        const snap = self.snapshotProbes();
 
-        // Union of TCP targets: ours plus everything peers gossip
-        const TargetKey = struct { ip: u32, port: u16 };
-        var target_keys: [32]TargetKey = undefined;
-        var n_targets: usize = 0;
-        for (extras[0..extra_count]) |t| {
-            if (n_targets >= target_keys.len) break;
-            target_keys[n_targets] = .{ .ip = ipToU32(t.ip), .port = t.port };
-            n_targets += 1;
-        }
-        outer: for (self.peers.items) |*p| {
-            for (p.remote_targets[0..p.remote_target_count]) |e| {
-                if (n_targets >= target_keys.len) break :outer;
-                var seen = false;
-                for (target_keys[0..n_targets]) |k| {
-                    if (k.ip == e.ip and k.port == e.port) {
-                        seen = true;
-                        break;
-                    }
-                }
-                if (!seen) {
-                    target_keys[n_targets] = .{ .ip = e.ip, .port = e.port };
-                    n_targets += 1;
-                }
-            }
-        }
+        var target_keys: [max_target_keys]TargetKey = undefined;
+        const n_targets = self.collectTargetKeys(&snap, &target_keys);
 
         if (observers.len <= 1 and n_targets == 0) return;
 
@@ -1439,7 +1468,7 @@ pub const Mesh = struct {
                         stdout.print("{s}—{s}{s}", .{ gray, reset, pad[0 .. col_width - 1] }) catch {};
                         continue;
                     }
-                    printLinkCell(stdout, self.linkBetween(col, row.node_id, peer_tcp[0..peer_tcp_count]), col_width);
+                    printLinkCell(stdout, self.linkBetween(col, row.node_id, snap.peer_tcp[0..snap.peer_tcp_count]), col_width);
                 }
                 stdout.print("\n", .{}) catch {};
             }
@@ -1462,26 +1491,8 @@ pub const Mesh = struct {
                 stdout.print("  {s}{s}", .{ shown, pad[0 .. label_width - shown.len] }) catch {};
 
                 for (observers[0..shown_obs]) |*col| {
-                    if (col.node_id == self.node_id) {
-                        var avg: ?u64 = null;
-                        var refused = false;
-                        for (extras[0..extra_count], 0..) |t, i| {
-                            if (ipToU32(t.ip) == k.ip and t.port == k.port and extra_tcp[i].alive()) {
-                                avg = extra_tcp[i].avg();
-                                refused = extra_tcp[i].refused;
-                                break;
-                            }
-                        }
-                        printTcpCell(stdout, avg, refused, col_width);
-                    } else if (self.findPeer(col.node_id)) |p| {
-                        if (p.targetStats(k.ip, k.port)) |e| {
-                            printTcpCell(stdout, statToOpt(e.tcp_avg), e.refused, col_width);
-                        } else {
-                            printTcpCell(stdout, null, false, col_width);
-                        }
-                    } else {
-                        printTcpCell(stdout, null, false, col_width);
-                    }
+                    const seen = self.targetSeenBy(col, k, &snap);
+                    printTcpCell(stdout, seen.avg, seen.refused, col_width);
                 }
                 stdout.print("\n", .{}) catch {};
             }
@@ -1617,6 +1628,195 @@ pub const Mesh = struct {
                 e.value_ptr.count - 1,
             }) catch {};
             degraded_shown += 1;
+        }
+    }
+
+    // Machine-readable snapshots for the --http endpoint. Written by the
+    // main thread into buffers the HTTP server thread serves, so building
+    // them here can walk mesh state without any locking beyond the probe
+    // snapshot. Observers are keyed by node id (stable across renames);
+    // the observers array maps ids to human labels.
+
+    fn writeJsonStat(w: StdoutWriter, key: []const u8, v: ?u64) void {
+        if (v) |x| {
+            w.print("\"{s}\":{d}", .{ key, x }) catch {};
+        } else {
+            w.print("\"{s}\":null", .{key}) catch {};
+        }
+    }
+
+    pub fn writeJson(self: *Mesh, w: StdoutWriter) void {
+        const now = monotonicMicros();
+        var observers: [1 + max_peers]Observer = undefined;
+        const num_obs = self.collectObservers(&observers, now);
+        var rows = self.collectRows(observers[0..num_obs]);
+        defer rows.deinit(self.allocator);
+        const snap = self.snapshotProbes();
+
+        w.print("{{\"schema_version\":1,\"generated_at_unix_us\":{d},\"node_id\":\"{x:0>16}\",\"hostname\":", .{
+            common.wallMicros(), self.node_id,
+        }) catch {};
+        common.writeJsonString(w, self.hostname[0..self.hostname_len]);
+
+        w.writeAll(",\"observers\":[") catch {};
+        for (observers[0..num_obs], 0..) |*o, i| {
+            w.print("{s}{{\"id\":\"{x:0>16}\",\"label\":", .{ if (i == 0) "" else ",", o.node_id }) catch {};
+            common.writeJsonString(w, o.label());
+            w.writeAll(",") catch {};
+            writeJsonStat(w, "data_age_us", if (o.age_us >= 0) @intCast(o.age_us) else null);
+            w.writeAll("}") catch {};
+        }
+
+        w.writeAll("],\"hosts\":[") catch {};
+        for (rows.items, 0..) |ip, ri| {
+            var ip_buf: [16]u8 = undefined;
+            w.print("{s}{{\"ip\":\"{s}\",\"name\":", .{ if (ri == 0) "" else ",", ipToString(u32ToIp(ip), &ip_buf) }) catch {};
+            if (self.names.get(ip)) |ne| {
+                common.writeJsonString(w, ne.name());
+            } else {
+                w.writeAll("null") catch {};
+            }
+            const degraded = if (self.hist.getPtr(ip)) |h| h.degraded() else false;
+            w.print(",\"degraded\":{},\"by_observer\":{{", .{degraded}) catch {};
+            var first = true;
+            for (observers[0..num_obs]) |*o| {
+                const stats = o.hosts.get(ip) orelse continue;
+                w.print("{s}\"{x:0>16}\":{{", .{ if (first) "" else "," , o.node_id }) catch {};
+                first = false;
+                writeJsonStat(w, "min_us", statToOpt(stats.min_us));
+                w.writeAll(",") catch {};
+                writeJsonStat(w, "avg_us", statToOpt(stats.avg_us));
+                w.writeAll(",") catch {};
+                writeJsonStat(w, "max_us", statToOpt(stats.max_us));
+                w.writeAll(",") catch {};
+                writeJsonStat(w, "jitter_us", statToOpt(stats.jitter_us));
+                w.print(",\"loss_pct\":{d}}}", .{stats.loss_pct}) catch {};
+            }
+            w.writeAll("}}") catch {};
+        }
+
+        w.writeAll("],\"links\":[") catch {};
+        var lfirst = true;
+        for (observers[0..num_obs]) |*from| {
+            for (observers[0..num_obs]) |*to| {
+                if (from.node_id == to.node_id) continue;
+                const link = self.linkBetween(from, to.node_id, snap.peer_tcp[0..snap.peer_tcp_count]);
+                if (link.udp == null and link.tcp == null) continue;
+                w.print("{s}{{\"from\":\"{x:0>16}\",\"to\":\"{x:0>16}\",", .{
+                    if (lfirst) "" else ",", from.node_id, to.node_id,
+                }) catch {};
+                lfirst = false;
+                writeJsonStat(w, "udp_us", link.udp);
+                w.writeAll(",") catch {};
+                writeJsonStat(w, "tcp_us", link.tcp);
+                w.print(",\"tcp_refused\":{}}}", .{link.refused}) catch {};
+            }
+        }
+
+        w.writeAll("],\"tcp_targets\":[") catch {};
+        var keys: [max_target_keys]TargetKey = undefined;
+        const nk = self.collectTargetKeys(&snap, &keys);
+        for (keys[0..nk], 0..) |k, ki| {
+            var ip_buf: [16]u8 = undefined;
+            w.print("{s}{{\"ip\":\"{s}\",\"port\":{d},\"by_observer\":{{", .{
+                if (ki == 0) "" else ",", ipToString(u32ToIp(k.ip), &ip_buf), k.port,
+            }) catch {};
+            var tfirst = true;
+            for (observers[0..num_obs]) |*o| {
+                const seen = self.targetSeenBy(o, k, &snap);
+                const avg = seen.avg orelse continue;
+                w.print("{s}\"{x:0>16}\":{{\"tcp_us\":{d},\"refused\":{}}}", .{
+                    if (tfirst) "" else ",", o.node_id, avg, seen.refused,
+                }) catch {};
+                tfirst = false;
+            }
+            w.writeAll("}}") catch {};
+        }
+        w.writeAll("]}\n") catch {};
+    }
+
+    // Prometheus exposition format. Series are labeled by observer node id
+    // (stable across hostname changes); nlh_observer_info maps ids to
+    // labels. Values follow Prometheus convention: seconds, ratios.
+    fn writePromLabelValue(w: StdoutWriter, s: []const u8) void {
+        for (s) |ch| switch (ch) {
+            '\\' => w.writeAll("\\\\") catch {},
+            '"' => w.writeAll("\\\"") catch {},
+            '\n' => w.writeAll("\\n") catch {},
+            else => w.writeByte(ch) catch {},
+        };
+    }
+
+    fn promSeconds(us: u64) f64 {
+        return @as(f64, @floatFromInt(us)) / 1e6;
+    }
+
+    pub fn writeMetrics(self: *Mesh, w: StdoutWriter) void {
+        const now = monotonicMicros();
+        var observers: [1 + max_peers]Observer = undefined;
+        const num_obs = self.collectObservers(&observers, now);
+        var rows = self.collectRows(observers[0..num_obs]);
+        defer rows.deinit(self.allocator);
+        const snap = self.snapshotProbes();
+
+        w.print("# HELP nlh_peers Live mesh peers known to this node\n# TYPE nlh_peers gauge\nnlh_peers {d}\n", .{self.peers.items.len}) catch {};
+        w.print("# HELP nlh_hosts Hosts in the combined matrix\n# TYPE nlh_hosts gauge\nnlh_hosts {d}\n", .{rows.items.len}) catch {};
+
+        w.writeAll("# HELP nlh_observer_info Maps observer ids to their labels\n# TYPE nlh_observer_info gauge\n") catch {};
+        for (observers[0..num_obs]) |*o| {
+            w.print("nlh_observer_info{{id=\"{x:0>16}\",label=\"", .{o.node_id}) catch {};
+            writePromLabelValue(w, o.label());
+            w.writeAll("\"} 1\n") catch {};
+        }
+
+        w.writeAll("# HELP nlh_host_latency_seconds Host latency from an observer's vantage\n# TYPE nlh_host_latency_seconds gauge\n") catch {};
+        w.writeAll("# HELP nlh_host_loss_ratio Probe loss toward a host from an observer's vantage\n# TYPE nlh_host_loss_ratio gauge\n") catch {};
+        for (rows.items) |ip| {
+            var ip_buf: [16]u8 = undefined;
+            const ip_str = ipToString(u32ToIp(ip), &ip_buf);
+            for (observers[0..num_obs]) |*o| {
+                const stats = o.hosts.get(ip) orelse continue;
+                const stat_names = [_][]const u8{ "min", "avg", "max", "jitter" };
+                const stat_vals = [_]u32{ stats.min_us, stats.avg_us, stats.max_us, stats.jitter_us };
+                for (stat_names, stat_vals) |sn, sv| {
+                    if (sv == no_data) continue;
+                    w.print("nlh_host_latency_seconds{{ip=\"{s}\",observer=\"{x:0>16}\",stat=\"{s}\"}} {d}\n", .{
+                        ip_str, o.node_id, sn, promSeconds(sv),
+                    }) catch {};
+                }
+                w.print("nlh_host_loss_ratio{{ip=\"{s}\",observer=\"{x:0>16}\"}} {d}\n", .{
+                    ip_str, o.node_id, @as(f64, @floatFromInt(stats.loss_pct)) / 100.0,
+                }) catch {};
+            }
+        }
+
+        w.writeAll("# HELP nlh_link_seconds Node-to-node link latency (from -> to)\n# TYPE nlh_link_seconds gauge\n") catch {};
+        for (observers[0..num_obs]) |*from| {
+            for (observers[0..num_obs]) |*to| {
+                if (from.node_id == to.node_id) continue;
+                const link = self.linkBetween(from, to.node_id, snap.peer_tcp[0..snap.peer_tcp_count]);
+                if (link.udp) |v| {
+                    w.print("nlh_link_seconds{{from=\"{x:0>16}\",to=\"{x:0>16}\",transport=\"udp\"}} {d}\n", .{ from.node_id, to.node_id, promSeconds(v) }) catch {};
+                }
+                if (link.tcp) |v| {
+                    w.print("nlh_link_seconds{{from=\"{x:0>16}\",to=\"{x:0>16}\",transport=\"tcp\"}} {d}\n", .{ from.node_id, to.node_id, promSeconds(v) }) catch {};
+                }
+            }
+        }
+
+        w.writeAll("# HELP nlh_tcp_target_seconds TCP connect latency to a --tcp-ping target\n# TYPE nlh_tcp_target_seconds gauge\n") catch {};
+        var keys: [max_target_keys]TargetKey = undefined;
+        const nk = self.collectTargetKeys(&snap, &keys);
+        for (keys[0..nk]) |k| {
+            var ip_buf: [16]u8 = undefined;
+            const ip_str = ipToString(u32ToIp(k.ip), &ip_buf);
+            for (observers[0..num_obs]) |*o| {
+                const seen = self.targetSeenBy(o, k, &snap);
+                const avg = seen.avg orelse continue;
+                w.print("nlh_tcp_target_seconds{{ip=\"{s}\",port=\"{d}\",observer=\"{x:0>16}\"}} {d}\n", .{
+                    ip_str, k.port, o.node_id, promSeconds(avg),
+                }) catch {};
+            }
         }
     }
 };

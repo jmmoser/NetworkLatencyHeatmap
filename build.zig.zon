@@ -11,5 +11,6 @@
         "mesh.zig",
         "probe.zig",
         "plat.zig",
+        "httpd.zig",
     },
 }

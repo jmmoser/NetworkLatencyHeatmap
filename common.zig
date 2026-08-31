@@ -172,6 +172,23 @@ pub const SocketPoller = struct {
     }
 };
 
+// Minimal blocking lock for cross-thread handoffs: the critical sections
+// copy at most a few kilobytes and contention is one thread every few
+// seconds, so spinning with a scheduler yield is plenty. (Zig 0.16's std
+// has no plain blocking thread mutex — std.Io.Mutex wants an Io instance
+// these modules don't carry.)
+pub const SpinLock = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    pub fn lock(self: *SpinLock) void {
+        while (!self.inner.tryLock()) std.Thread.yield() catch {};
+    }
+
+    pub fn unlock(self: *SpinLock) void {
+        self.inner.unlock();
+    }
+};
+
 pub fn ipToU32(ip: [4]u8) u32 {
     return @as(u32, ip[0]) << 24 | @as(u32, ip[1]) << 16 | @as(u32, ip[2]) << 8 | @as(u32, ip[3]);
 }
