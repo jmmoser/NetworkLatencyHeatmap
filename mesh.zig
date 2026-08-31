@@ -1095,6 +1095,25 @@ pub const Mesh = struct {
     }
 
     fn render(self: *Mesh, stdout: StdoutWriter, now: i64, next_scan_at: ?i64) void {
+        if (!common.stdout_is_tty) {
+            // Piped: each render is an appended plain-text snapshot
+            self.renderBody(stdout, now, next_scan_at);
+            return;
+        }
+        // TTY: compose the frame off-screen, then overwrite the previous
+        // frame in place and emit it as one single write — never
+        // clear-then-redraw, which flashes a blank screen between frames
+        // (see common.encodeFrame)
+        var body: std.Io.Writer.Allocating = .init(self.allocator);
+        defer body.deinit();
+        self.renderBody(&body.writer, now, next_scan_at);
+        var frame: std.Io.Writer.Allocating = .init(self.allocator);
+        defer frame.deinit();
+        common.encodeFrame(&frame.writer, body.written()) catch return;
+        stdout.writeAll(frame.written()) catch {};
+    }
+
+    fn renderBody(self: *Mesh, stdout: StdoutWriter, now: i64, next_scan_at: ?i64) void {
         const reset = common.sgr("\x1b[0m");
         const bold = common.sgr("\x1b[1m");
         const gray = common.sgr("\x1b[90m");
@@ -1133,10 +1152,6 @@ pub const Mesh = struct {
         while (kit.next()) |k| rows.append(self.allocator, k.*) catch {};
         std.mem.sort(u32, rows.items, {}, std.sort.asc(u32));
 
-        // Redraw from the top; the matrix is a live view, not a log. When
-        // output is piped there is no screen to clear — each render is
-        // appended as a plain snapshot instead.
-        if (common.stdout_is_tty) stdout.print("\x1b[2J\x1b[H", .{}) catch {};
         stdout.print("{s}╔══════════════════════════════════════════════════════════════╗{s}\n", .{ cyan, reset }) catch {};
         stdout.print("{s}║{s}               {s}Network Latency Mesh View{s}                      {s}║{s}\n", .{ cyan, reset, bold, reset, cyan, reset }) catch {};
         stdout.print("{s}╚══════════════════════════════════════════════════════════════╝{s}\n\n", .{ cyan, reset }) catch {};

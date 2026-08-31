@@ -11,6 +11,7 @@ A fast network scanner that discovers hosts on your network and measures their l
 - **Kernel receive timestamps**: Uses `SO_TIMESTAMP` on Linux and macOS so replies are stamped by the kernel on arrival — process wakeup and scheduling delay don't inflate measured RTTs (falls back to userspace timestamps where unavailable, including on Windows)
 - **Monotonic timing**: All pacing, timeouts, and fallback measurements use `CLOCK_MONOTONIC` (`QueryPerformanceCounter` on Windows); kernel stamps (wall clock only) are cross-checked against a monotonic upper bound, so an NTP step or slew mid-scan can't corrupt samples or stall the scanner
 - **Visual heatmap**: Color-coded latency display to quickly identify slow devices
+- **Flicker-free live view**: the mesh matrix never clears the screen between frames — each redraw overwrites the previous frame in place (erasing only stale line tails and leftover rows), is emitted as a single write, and is wrapped in terminal synchronized output (mode 2026) so capable terminals commit it atomically
 - **Concurrent scanning**: Uses separate sender/receiver threads for maximum throughput
 - **Large subnet support**: Can scan /16 networks (65k+ hosts) efficiently
 - **Default-route-aware auto-detection**: With no subnet argument, the scanner picks the interface carrying the default route (not just the first one up), so VPN tunnels, VM bridges, and container networks don't hijack the scan — the chosen interface is printed so you can verify
