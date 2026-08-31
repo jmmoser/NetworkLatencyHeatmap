@@ -1,0 +1,44 @@
+name: Release
+
+# Pushing a tag like v0.2.0 builds release binaries for all six supported
+# OS/arch combinations (Zig cross-compiles them all from one runner) and
+# attaches them to a GitHub release, so nobody needs a Zig toolchain to
+# run the scanner on a laptop, NAS, or Pi.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Run tests
+        run: zig build test
+      - name: Cross-compile all targets
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          for target in x86_64-linux aarch64-linux x86_64-macos aarch64-macos x86_64-windows aarch64-windows; do
+            zig build -Doptimize=ReleaseFast -Dtarget="$target" --prefix "zig-out/$target"
+            name="latency-heatmap-${version}-${target}"
+            if [[ "$target" == *windows* ]]; then
+              (cd "zig-out/$target/bin" && zip -q "$GITHUB_WORKSPACE/dist/${name}.zip" latency-heatmap.exe)
+            else
+              tar -C "zig-out/$target/bin" -czf "dist/${name}.tar.gz" latency-heatmap
+            fi
+          done
+          (cd dist && sha256sum ./* > SHA256SUMS)
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
