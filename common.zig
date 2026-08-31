@@ -298,6 +298,30 @@ pub fn writeJsonString(w: StdoutWriter, s: []const u8) void {
     w.writeByte('"') catch {};
 }
 
+// In-place frame overwrite for live TTY views. Clear-then-redraw
+// (\x1b[2J followed by many small writes) lets the terminal repaint while
+// the screen is blank or half-drawn, which the user sees as flicker.
+// Instead, the previous frame is overwritten where it stands: home the
+// cursor, rewrite every line erasing only its stale tail (EL), then erase
+// whatever rows the previous frame had below this one (ED). No cell is
+// ever blanked before its new content is written, so there is no blank
+// state to flash — even on terminals that ignore the synchronized-output
+// wrap (DEC private mode 2026) asking capable ones to commit the frame
+// atomically. The cursor is hidden while it jumps; hide and show travel
+// inside the same frame, so it never visibly blinks out. The caller
+// emits the encoded frame as a single write.
+pub fn encodeFrame(out: *std.Io.Writer, body: []const u8) !void {
+    try out.writeAll("\x1b[?2026h\x1b[?25l\x1b[H");
+    var rest = body;
+    while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+        try out.writeAll(rest[0..nl]);
+        try out.writeAll("\x1b[K\n");
+        rest = rest[nl + 1 ..];
+    }
+    try out.writeAll(rest);
+    try out.writeAll("\x1b[0J\x1b[?25h\x1b[?2026l");
+}
+
 pub fn displayWidth(s: []const u8) usize {
     // Count display width, accounting for multi-byte UTF-8 and ANSI escape sequences
     var width: usize = 0;
@@ -367,6 +391,28 @@ test "writeJsonString escapes quotes, backslashes, and control bytes" {
     var w = std.Io.Writer.fixed(&buf);
     writeJsonString(&w, "a\"b\\c\n");
     try testing.expectEqualStrings("\"a\\\"b\\\\c\\u000a\"", w.buffered());
+}
+
+test "encodeFrame overwrites in place: sync wrap, EL per line, ED at end" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try encodeFrame(&w, "ab\ncd\n");
+    try testing.expectEqualStrings(
+        "\x1b[?2026h\x1b[?25l\x1b[H" ++ "ab\x1b[K\ncd\x1b[K\n" ++ "\x1b[0J\x1b[?25h\x1b[?2026l",
+        w.buffered(),
+    );
+    // The frame must never blank the screen before redrawing
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\x1b[2J") == null);
+}
+
+test "encodeFrame handles a body without a trailing newline" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try encodeFrame(&w, "tail");
+    try testing.expectEqualStrings(
+        "\x1b[?2026h\x1b[?25l\x1b[H" ++ "tail" ++ "\x1b[0J\x1b[?25h\x1b[?2026l",
+        w.buffered(),
+    );
 }
 
 test "monotonicMicros is nondecreasing" {

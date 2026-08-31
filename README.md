@@ -16,6 +16,7 @@ A fast network scanner that discovers hosts on your network and measures their l
 - **Trend detection**: Mesh mode keeps a rolling history of scan averages per host and calls out hosts that just degraded versus their own recent baseline
 - **Authenticated mesh**: `--mesh-key` HMAC-tags every mesh datagram so only nodes sharing the key can join or inject results
 - **Visual heatmap**: Color-coded latency display to quickly identify slow devices
+- **Flicker-free live view**: the mesh matrix never clears the screen between frames — each redraw overwrites the previous frame in place (erasing only stale line tails and leftover rows), is emitted as a single write, and is wrapped in terminal synchronized output (mode 2026) so capable terminals commit it atomically
 - **Concurrent scanning**: Uses separate sender/receiver threads for maximum throughput
 - **Large subnet support**: Can scan /16 networks (65k+ hosts) efficiently
 - **Default-route-aware auto-detection**: With no subnet argument, the scanner picks the interface carrying the default route (not just the first one up), so VPN tunnels, VM bridges, and container networks don't hijack the scan — the chosen interface is printed so you can verify
