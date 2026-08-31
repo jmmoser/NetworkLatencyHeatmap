@@ -104,6 +104,51 @@ const max_display_observers = 6;
 // Sentinel in wire stats: host was discovered but produced no latency sample
 pub const no_data: u32 = 0xFFFF_FFFF;
 
+// --mesh-key: every datagram carries a truncated HMAC-SHA256 tag, so only
+// nodes sharing the key can join the mesh, inject results, or forge pongs.
+// The secured protocol uses its own magic ("NLS2"): a keyed and an unkeyed
+// mesh on the same LAN ignore each other cleanly instead of forming a
+// confusing half-mesh. This authenticates and integrity-protects; it does
+// NOT encrypt (results are readable on the wire) and does not prevent
+// replay of captured datagrams.
+pub const secured_magic = [4]u8{ 'N', 'L', 'S', '2' };
+pub const mac_len = 16;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+
+// The CLI passphrase is hashed once into a fixed-size HMAC key
+pub fn deriveKey(secret: []const u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(secret, &out, .{});
+    return out;
+}
+
+// Copy msg into out, stamp the secured magic, append the tag. The tag is
+// computed over the stamped message, so it also binds the magic.
+pub fn sealMessage(key: *const [32]u8, msg: []const u8, out: []u8) []const u8 {
+    std.debug.assert(out.len >= msg.len + mac_len);
+    std.debug.assert(msg.len >= header_len);
+    @memcpy(out[0..msg.len], msg);
+    @memcpy(out[0..4], &secured_magic);
+    var tag: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&tag, out[0..msg.len], key);
+    @memcpy(out[msg.len..][0..mac_len], tag[0..mac_len]);
+    return out[0 .. msg.len + mac_len];
+}
+
+// Verify and strip the tag in place; returns the plain-protocol message
+// (magic rewritten) or null for anything unauthenticated or tampered.
+pub fn openMessage(key: *const [32]u8, buf: []u8) ?[]u8 {
+    if (buf.len < header_len + mac_len) return null;
+    const body = buf[0 .. buf.len - mac_len];
+    var tag: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&tag, body, key);
+    const got: [mac_len]u8 = buf[buf.len - mac_len ..][0..mac_len].*;
+    if (!std.crypto.timing_safe.eql([mac_len]u8, tag[0..mac_len].*, got)) return null;
+    if (!std.mem.eql(u8, body[0..4], &secured_magic)) return null;
+    @memcpy(body[0..4], &protocol_magic);
+    return body;
+}
+
 pub const HostStats = struct {
     min_us: u32,
     avg_us: u32,
@@ -512,6 +557,7 @@ pub const Mesh = struct {
     tcp_listen: plat.Socket,
     probes: ProbeShared,
     prober: ?std.Thread,
+    key: ?[32]u8, // --mesh-key: authenticate every datagram
     node_id: u64,
     hostname: [max_hostname]u8,
     hostname_len: u8,
@@ -545,7 +591,7 @@ pub const Mesh = struct {
     last_countdown_s: i64, // rescan countdown shown by the last render, -1 = none
     dirty: bool,
 
-    pub fn init(allocator: std.mem.Allocator, port: u16, subnet: [4]u8, mask_bits: u8, tcp_targets: []const probe.TcpTarget) !Mesh {
+    pub fn init(allocator: std.mem.Allocator, port: u16, subnet: [4]u8, mask_bits: u8, tcp_targets: []const probe.TcpTarget, key: ?[32]u8) !Mesh {
         plat.netInit();
         const sock = plat.openSocket(plat.AF_INET, plat.SOCK_DGRAM, 0);
         if (!plat.isValidSocket(sock)) return error.MeshSocketFailed;
@@ -632,6 +678,7 @@ pub const Mesh = struct {
             .tcp_listen = tcp_listen,
             .probes = probes,
             .prober = null,
+            .key = key,
             .node_id = node_id,
             .hostname = hostname_buf,
             .hostname_len = hostname_len,
@@ -805,6 +852,12 @@ pub const Mesh = struct {
     fn sendDatagram(self: *Mesh, data: []const u8, dest: *const posix.sockaddr.in) void {
         // Errors (buffer full, unreachable) are ignored: beacons and gossip
         // repeat on an interval, so a dropped datagram heals itself
+        if (self.key) |*k| {
+            var sealed_buf: [recv_buf_len]u8 = undefined;
+            const sealed = sealMessage(k, data, &sealed_buf);
+            _ = plat.sendto(self.sock, sealed, dest, @sizeOf(posix.sockaddr.in));
+            return;
+        }
         _ = plat.sendto(self.sock, data, dest, @sizeOf(posix.sockaddr.in));
     }
 
@@ -1047,7 +1100,11 @@ pub const Mesh = struct {
             const rc = plat.recvfrom(self.sock, &buf, &src, &src_len);
             if (rc <= 0) break;
             if (src.family != posix.AF.INET) continue;
-            const parsed = parseMessage(buf[0..@intCast(rc)]) orelse continue;
+            var msg: []u8 = buf[0..@intCast(rc)];
+            if (self.key) |*k| {
+                msg = openMessage(k, msg) orelse continue;
+            }
+            const parsed = parseMessage(msg) orelse continue;
             self.handleMessage(parsed, &src, now);
         }
     }
@@ -2046,4 +2103,87 @@ test "medianOfSorted picks the middle element" {
     try testing.expectEqual(@as(?u64, 5), medianOfSorted(&.{5}));
     try testing.expectEqual(@as(?u64, 7), medianOfSorted(&.{ 1, 7, 9 }));
     try testing.expectEqual(@as(?u64, 8), medianOfSorted(&.{ 1, 7, 8, 9 }));
+}
+
+test "sealed messages round-trip through open and parse" {
+    const key = deriveKey("swordfish");
+    var msg_buf: [beacon_fixed_len + max_hostname]u8 = undefined;
+    const msg = encodeBeacon(&msg_buf, 42, 7, 3, "office-nas");
+
+    var sealed_buf: [recv_buf_len]u8 = undefined;
+    var wire: [recv_buf_len]u8 = undefined;
+    const sealed = sealMessage(&key, msg, &sealed_buf);
+    try testing.expectEqual(msg.len + mac_len, sealed.len);
+    try testing.expectEqualSlices(u8, &secured_magic, sealed[0..4]);
+
+    // A sealed message must NOT parse as the plain protocol
+    try testing.expect(parseMessage(sealed) == null);
+
+    @memcpy(wire[0..sealed.len], sealed);
+    const opened = openMessage(&key, wire[0..sealed.len]).?;
+    const parsed = parseMessage(opened).?;
+    try testing.expectEqual(@as(u64, 42), parsed.beacon.node_id);
+    try testing.expectEqualStrings("office-nas", parsed.beacon.hostname);
+}
+
+test "openMessage rejects tampering, wrong keys, and unauthenticated traffic" {
+    const key = deriveKey("swordfish");
+    var msg_buf: [beacon_fixed_len + max_hostname]u8 = undefined;
+    const msg = encodeBeacon(&msg_buf, 42, 7, 3, "office-nas");
+    var sealed_buf: [recv_buf_len]u8 = undefined;
+    const sealed = sealMessage(&key, msg, &sealed_buf);
+
+    var wire: [recv_buf_len]u8 = undefined;
+
+    // Flipped body byte
+    @memcpy(wire[0..sealed.len], sealed);
+    wire[header_len] ^= 1;
+    try testing.expect(openMessage(&key, wire[0..sealed.len]) == null);
+
+    // Flipped tag byte
+    @memcpy(wire[0..sealed.len], sealed);
+    wire[sealed.len - 1] ^= 1;
+    try testing.expect(openMessage(&key, wire[0..sealed.len]) == null);
+
+    // Wrong key
+    const other = deriveKey("marlin");
+    @memcpy(wire[0..sealed.len], sealed);
+    try testing.expect(openMessage(&other, wire[0..sealed.len]) == null);
+
+    // Unauthenticated plain-protocol datagram
+    @memcpy(wire[0..msg.len], msg);
+    try testing.expect(openMessage(&key, wire[0..msg.len]) == null);
+
+    // Too short to even carry a tag
+    try testing.expect(openMessage(&key, wire[0..header_len]) == null);
+}
+
+// Fuzz the datagram parser: it eats untrusted broadcast traffic, so no
+// input may crash it or make a parsed view exceed its buffer. Seeding the
+// real magic into some inputs lets the fuzzer reach the per-type parsing
+// instead of bouncing off the magic check.
+fn fuzzParseMessage(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [recv_buf_len]u8 = undefined;
+    const len = smith.slice(&buf);
+    if (len >= 5 and smith.value(bool)) {
+        @memcpy(buf[0..4], &protocol_magic);
+        if (smith.value(bool)) buf[4] = smith.valueRangeAtMost(u8, 1, 5);
+    }
+    const parsed = parseMessage(buf[0..len]) orelse return;
+    switch (parsed) {
+        .beacon => |b| try testing.expect(b.hostname.len <= max_hostname),
+        .results => |r| {
+            try testing.expect(r.entries.len % entry_len == 0);
+            try testing.expect(r.entries.len / entry_len <= entries_per_chunk);
+        },
+        .links => |l| {
+            try testing.expect(l.link_bytes.len % link_entry_len == 0);
+            try testing.expect(l.target_bytes.len % target_entry_len == 0);
+        },
+        .ping, .pong => {},
+    }
+}
+
+test "fuzz parseMessage on arbitrary datagrams" {
+    try std.testing.fuzz({}, fuzzParseMessage, .{});
 }

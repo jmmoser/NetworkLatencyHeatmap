@@ -311,6 +311,7 @@ const Config = struct {
     resolve_names: bool = true, // Reverse-DNS discovered hosts (--no-names)
     json: bool = false, // One-shot scan: emit JSON instead of the heatmap
     http_port: u16 = 0, // Mesh mode: serve /json + /metrics (0 = off)
+    mesh_key: ?[32]u8 = null, // --mesh-key: authenticate mesh datagrams
 
     // Extra TCP ping targets (--tcp-ping ip:port): hosts that aren't running
     // this tool but answer a SYN on a known port with SYN-ACK or RST
@@ -1395,6 +1396,7 @@ fn runMeshMode(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
         config.subnet,
         config.mask_bits,
         config.tcp_targets[0..config.tcp_target_count],
+        config.mesh_key,
     ) catch |err| {
         std.debug.print("Error: failed to open mesh UDP socket on port {d}: {s}\n", .{ config.mesh_port, @errorName(err) });
         return err;
@@ -1537,6 +1539,10 @@ pub fn main(init: std.process.Init) !void {
                 \\  --http <port>  Mesh mode: serve the live mesh state over HTTP —
                 \\              /json (full snapshot) and /metrics (Prometheus) — so
                 \\              Grafana or scripts can scrape any node
+                \\  --mesh-key <secret>  Mesh mode: authenticate every mesh datagram
+                \\              with an HMAC tag; nodes without the same key are
+                \\              ignored. Authenticates, does not encrypt; give every
+                \\              node the same secret
                 \\  --json      One-shot scan: print results as a JSON document on
                 \\              stdout (progress and decoration are suppressed);
                 \\              not applicable to --mesh, which serves --http instead
@@ -1593,6 +1599,10 @@ pub fn main(init: std.process.Init) !void {
             config.mesh_port = std.fmt.parseInt(u16, value, 10) catch
                 return invalidArgValue("--mesh-port", value);
             if (config.mesh_port == 0) return invalidArgValue("--mesh-port", value);
+        } else if (std.mem.eql(u8, arg, "--mesh-key")) {
+            const value = nextArgValue(args, &i);
+            if (value.len == 0) return invalidArgValue("--mesh-key", value);
+            config.mesh_key = mesh_mod.deriveKey(value);
         } else if (std.mem.eql(u8, arg, "--http")) {
             const value = nextArgValue(args, &i);
             config.http_port = std.fmt.parseInt(u16, value, 10) catch
@@ -1636,6 +1646,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (config.http_port != 0 and !config.mesh) {
         std.debug.print("Error: --http serves the mesh matrix; add --mesh (one-shot scans have --json)\n", .{});
+        std.process.exit(1);
+    }
+    if (config.mesh_key != null and !config.mesh) {
+        std.debug.print("Error: --mesh-key authenticates mesh traffic; add --mesh\n", .{});
         std.process.exit(1);
     }
 
