@@ -358,6 +358,51 @@ pub fn spreadIsUneven(min_avg: u64, max_avg: u64) bool {
 // at that level is a real symptom, not sampling noise.
 pub const loss_flag_pct: u8 = 20;
 
+// Rolling per-host history of scan averages from this node's own vantage,
+// so a rescan loop can tell "this host degraded twenty minutes ago" from
+// "this host has always been slow". A snapshot can't; the history can.
+pub const history_len = 16;
+
+pub const HostHistory = struct {
+    avgs: [history_len]u32 = undefined,
+    count: u8 = 0,
+    idx: u8 = 0,
+
+    pub fn push(self: *HostHistory, avg_us: u32) void {
+        self.avgs[self.idx] = avg_us;
+        self.idx = (self.idx + 1) % history_len;
+        if (self.count < history_len) self.count += 1;
+    }
+
+    pub fn latest(self: *const HostHistory) ?u32 {
+        if (self.count == 0) return null;
+        return self.avgs[(self.idx + history_len - 1) % history_len];
+    }
+
+    // Median of everything before the newest sample — the baseline the
+    // current scan is judged against. Needs a few scans of history first;
+    // the median makes one earlier outlier unable to fake a baseline.
+    pub fn baseline(self: *const HostHistory) ?u32 {
+        if (self.count < 4) return null;
+        var tmp: [history_len]u32 = undefined;
+        const n: usize = self.count - 1;
+        for (0..n) |i| {
+            // Oldest-first walk that skips the newest entry
+            tmp[i] = self.avgs[(self.idx + history_len - self.count + @as(u8, @intCast(i))) % history_len];
+        }
+        std.mem.sort(u32, tmp[0..n], {}, std.sort.asc(u32));
+        return tmp[n / 2];
+    }
+
+    // Same shape as spreadIsUneven: a trend needs both the ratio and an
+    // absolute gap bigger than jitter noise
+    pub fn degraded(self: *const HostHistory) bool {
+        const base = self.baseline() orelse return false;
+        const cur = self.latest() orelse return false;
+        return cur >= @as(u64, base) * 3 and cur - base > 2000;
+    }
+};
+
 fn medianOfSorted(sorted: []const u64) ?u64 {
     if (sorted.len == 0) return null;
     return sorted[sorted.len / 2];
@@ -503,6 +548,10 @@ pub const Mesh = struct {
     // scanned show as bare IPs.
     names: std.AutoHashMap(u32, NameEntry),
 
+    // Per-host history of scan averages from this node's vantage, for the
+    // degradation insight (local only; peers run their own history)
+    hist: std.AutoHashMap(u32, HostHistory),
+
     peers: std.ArrayList(Peer),
 
     last_beacon_us: i64,
@@ -618,6 +667,7 @@ pub const Mesh = struct {
             .local_entries = .empty,
             .local_scan_us = 0,
             .names = std.AutoHashMap(u32, NameEntry).init(allocator),
+            .hist = std.AutoHashMap(u32, HostHistory).init(allocator),
             .peers = .empty,
             .last_beacon_us = 0,
             .last_gossip_us = 0,
@@ -641,6 +691,7 @@ pub const Mesh = struct {
         self.local_hosts.deinit();
         self.local_entries.deinit(self.allocator);
         self.names.deinit();
+        self.hist.deinit();
         self.poller.deinit();
         if (plat.isValidSocket(self.tcp_listen)) plat.closeSocket(self.tcp_listen);
         plat.closeSocket(self.sock);
@@ -748,6 +799,11 @@ pub const Mesh = struct {
                 var ne = NameEntry{ .buf = undefined, .len = r.name_len };
                 @memcpy(ne.buf[0..r.name_len], r.name());
                 try self.names.put(ip, ne);
+            }
+            if (stats.hasData()) {
+                const gop = try self.hist.getOrPut(ip);
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+                gop.value_ptr.push(stats.avg_us);
             }
         }
 
@@ -1528,6 +1584,40 @@ pub const Mesh = struct {
                 loss_flag_pct,
             }) catch {};
         }
+
+        // Trend detection against this node's own scan history: a host that
+        // is slow NOW but wasn't over the last scans is a fresh problem, not
+        // a slow device — a snapshot can't tell those apart
+        var degraded_shown: usize = 0;
+        var hit = self.hist.iterator();
+        while (hit.next()) |e| {
+            if (degraded_shown >= 5) break;
+            if (!e.value_ptr.degraded()) continue;
+            if (!self.local_hosts.contains(e.key_ptr.*)) continue; // aged out
+            if (!printed_header) {
+                stdout.print("\n  {s}⚠ Insights:{s}\n", .{ yellow, reset }) catch {};
+                printed_header = true;
+            }
+            var ip_buf: [16]u8 = undefined;
+            var cur_buf: [16]u8 = undefined;
+            var base_buf: [16]u8 = undefined;
+            var name_store: [common.PingResult.name_max]u8 = undefined;
+            var name_str: []const u8 = "";
+            if (self.names.get(e.key_ptr.*)) |ne| {
+                @memcpy(name_store[0..ne.len], ne.name());
+                name_str = name_store[0..ne.len];
+            }
+            stdout.print("    {s}{s}{s}{s} degraded: {s} this scan vs {s} median over the previous {d}\n", .{
+                ipToString(u32ToIp(e.key_ptr.*), &ip_buf),
+                if (name_str.len > 0) " (" else "",
+                name_str,
+                if (name_str.len > 0) ")" else "",
+                formatLatency(@as(?u64, e.value_ptr.latest().?), &cur_buf),
+                formatLatency(@as(?u64, e.value_ptr.baseline().?), &base_buf),
+                e.value_ptr.count - 1,
+            }) catch {};
+            degraded_shown += 1;
+        }
     }
 };
 
@@ -1711,6 +1801,44 @@ test "spreadIsUneven requires both ratio and absolute gap" {
     try testing.expect(!spreadIsUneven(1000, 2500)); // gap but under 3x
     try testing.expect(!spreadIsUneven(100, 900)); // 9x but under 2ms gap
     try testing.expect(!spreadIsUneven(500, 500)); // identical
+}
+
+test "HostHistory needs history before calling a trend" {
+    var h = HostHistory{};
+    try testing.expectEqual(@as(?u32, null), h.latest());
+    try testing.expectEqual(@as(?u32, null), h.baseline());
+    try testing.expect(!h.degraded());
+
+    h.push(1000);
+    h.push(1200);
+    h.push(50000); // a spike with too little history is not a trend
+    try testing.expectEqual(@as(?u32, 50000), h.latest());
+    try testing.expect(!h.degraded());
+}
+
+test "HostHistory flags a degradation against the median baseline" {
+    var h = HostHistory{};
+    h.push(1000);
+    h.push(1100);
+    h.push(900);
+    h.push(1000);
+    try testing.expect(!h.degraded());
+    try testing.expectEqual(@as(?u32, 1000), h.baseline());
+
+    h.push(40000); // 40x the baseline, gap far beyond jitter
+    try testing.expect(h.degraded());
+    try testing.expectEqual(@as(?u32, 40000), h.latest());
+
+    // A recovery clears the flag; the earlier spike can't fake a baseline
+    h.push(1000);
+    try testing.expect(!h.degraded());
+}
+
+test "HostHistory ring wraps without losing the newest sample" {
+    var h = HostHistory{};
+    for (0..history_len * 2) |i| h.push(@intCast(100 + i));
+    try testing.expectEqual(@as(u8, history_len), h.count);
+    try testing.expectEqual(@as(?u32, 100 + history_len * 2 - 1), h.latest());
 }
 
 test "medianOfSorted picks the middle element" {
