@@ -308,6 +308,7 @@ const Config = struct {
     mesh_port: u16 = mesh_mod.default_port,
     rescan_interval_s: u32 = 60, // Mesh mode: seconds between scans, 0 = scan once
     resolve_names: bool = true, // Reverse-DNS discovered hosts (--no-names)
+    json: bool = false, // One-shot scan: emit JSON instead of the heatmap
 
     // Extra TCP ping targets (--tcp-ping ip:port): hosts that aren't running
     // this tool but answer a SYN on a known port with SYN-ACK or RST
@@ -1213,6 +1214,50 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
     stdout.print("\n{s}══════════════════════════════════════════════════════════════{s}\n", .{ bold, reset }) catch {};
 }
 
+fn printJsonField(stdout: StdoutWriter, key: []const u8, v: ?u64) void {
+    if (v) |x| {
+        stdout.print("\"{s}\": {d}", .{ key, x }) catch {};
+    } else {
+        stdout.print("\"{s}\": null", .{key}) catch {};
+    }
+}
+
+// One-shot machine-readable output (--json): the whole scan as a single
+// JSON document. Latency fields are integers in microseconds, null where
+// the host produced no sample.
+fn printJson(stdout: StdoutWriter, results: []const PingResult, config: Config) void {
+    stdout.print("{{\n", .{}) catch {};
+    stdout.print("  \"schema_version\": 1,\n", .{}) catch {};
+    stdout.print("  \"scanned_at_unix_us\": {d},\n", .{wallMicros()}) catch {};
+    stdout.print("  \"subnet\": \"{d}.{d}.{d}.{d}/{d}\",\n", .{
+        config.subnet[0], config.subnet[1], config.subnet[2], config.subnet[3], config.mask_bits,
+    }) catch {};
+    stdout.print("  \"pings_per_host\": {d},\n", .{config.latency_pings}) catch {};
+    stdout.print("  \"hosts\": [", .{}) catch {};
+    for (results, 0..) |*r, i| {
+        stdout.print("{s}\n    {{ \"ip\": \"{d}.{d}.{d}.{d}\", \"name\": ", .{
+            if (i == 0) "" else ",", r.ip[0], r.ip[1], r.ip[2], r.ip[3],
+        }) catch {};
+        if (r.name_len > 0) {
+            common.writeJsonString(stdout, r.name());
+        } else {
+            stdout.print("null", .{}) catch {};
+        }
+        stdout.print(", ", .{}) catch {};
+        printJsonField(stdout, "min_us", r.latency_us);
+        stdout.print(", ", .{}) catch {};
+        printJsonField(stdout, "avg_us", r.latency_avg);
+        stdout.print(", ", .{}) catch {};
+        printJsonField(stdout, "max_us", r.latency_max);
+        stdout.print(", ", .{}) catch {};
+        printJsonField(stdout, "jitter_us", r.jitter_us);
+        stdout.print(", \"sent\": {d}, \"received\": {d}, \"loss_pct\": {d} }}", .{
+            r.sent, r.received, r.lossPct(),
+        }) catch {};
+    }
+    stdout.print("{s}]\n}}\n", .{if (results.len == 0) "" else "\n  "}) catch {};
+}
+
 fn printLegend(stdout: StdoutWriter) void {
     const reset = common.sgr("\x1b[0m");
     stdout.print("\n{s}Legend:{s} ", .{ common.sgr("\x1b[1m"), reset }) catch {};
@@ -1457,6 +1502,9 @@ pub fn main(init: std.process.Init) !void {
                 \\              port (SYN→SYN-ACK, or RST from a closed port — both time
                 \\              the host's stack). Works on devices not running this
                 \\              tool; repeatable, up to 16 targets
+                \\  --json      One-shot scan: print results as a JSON document on
+                \\              stdout (progress and decoration are suppressed);
+                \\              not applicable to --mesh, which serves --http instead
                 \\  --no-names  Skip reverse-DNS lookups of discovered hosts (names
                 \\              come from the system resolver after each scan, with a
                 \\              soft time budget so slow DNS can't stall the scanner)
@@ -1501,6 +1549,8 @@ pub fn main(init: std.process.Init) !void {
             no_color = true;
         } else if (std.mem.eql(u8, arg, "--no-names")) {
             config.resolve_names = false;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            config.json = true;
         } else if (std.mem.eql(u8, arg, "--mesh")) {
             config.mesh = true;
         } else if (std.mem.eql(u8, arg, "--mesh-port")) {
@@ -1540,17 +1590,26 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Error: --tcp-ping targets are probed by mesh mode; add --mesh\n", .{});
         std.process.exit(1);
     }
+    if (config.json and config.mesh) {
+        std.debug.print("Error: --json is for one-shot scans; mesh mode serves machine-readable output over --http\n", .{});
+        std.process.exit(1);
+    }
 
     common.initTerm(no_color);
+
+    // With --json, stdout carries exactly one JSON document: progress and
+    // decoration go nowhere instead of corrupting it
+    var discard = std.Io.Writer.Discarding.init(&.{});
+    const info_out: StdoutWriter = if (config.json) &discard.writer else stdout;
 
     // Print banner
     const cyan = common.sgr("\x1b[96m");
     const bold = common.sgr("\x1b[1m");
     const reset = common.sgr("\x1b[0m");
-    stdout.print("\n", .{}) catch {};
-    stdout.print("{s}╔══════════════════════════════════════════════════════════════╗{s}\n", .{ cyan, reset }) catch {};
-    stdout.print("{s}║{s}             {s}Network Latency Heatmap Scanner{s}                  {s}║{s}\n", .{ cyan, reset, bold, reset, cyan, reset }) catch {};
-    stdout.print("{s}╚══════════════════════════════════════════════════════════════╝{s}\n", .{ cyan, reset }) catch {};
+    info_out.print("\n", .{}) catch {};
+    info_out.print("{s}╔══════════════════════════════════════════════════════════════╗{s}\n", .{ cyan, reset }) catch {};
+    info_out.print("{s}║{s}             {s}Network Latency Heatmap Scanner{s}                  {s}║{s}\n", .{ cyan, reset, bold, reset, cyan, reset }) catch {};
+    info_out.print("{s}╚══════════════════════════════════════════════════════════════╝{s}\n", .{ cyan, reset }) catch {};
 
     var subnet_buf: [32]u8 = undefined;
     const subnet_str = std.fmt.bufPrint(&subnet_buf, "{}.{}.{}.{}/{}", .{
@@ -1561,19 +1620,19 @@ pub fn main(init: std.process.Init) !void {
         config.mask_bits,
     }) catch "???";
 
-    stdout.print("\n  Subnet: {s}", .{subnet_str}) catch {};
+    info_out.print("\n  Subnet: {s}", .{subnet_str}) catch {};
     if (!subnet_set) {
         if (detected_subnet) |detected| {
-            stdout.print(" (auto-detected on {s}{s})", .{
+            info_out.print(" (auto-detected on {s}{s})", .{
                 detected.name(),
                 if (detected.on_default_route) ", default route" else "",
             }) catch {};
         } else {
-            stdout.print(" (default; no local subnet detected)", .{}) catch {};
+            info_out.print(" (default; no local subnet detected)", .{}) catch {};
         }
     }
-    stdout.print("\n", .{}) catch {};
-    stdout.print("  Discovery timeout: {d}ms | Latency pings: {d} | Ping timeout: {d}ms\n", .{
+    info_out.print("\n", .{}) catch {};
+    info_out.print("  Discovery timeout: {d}ms | Latency pings: {d} | Ping timeout: {d}ms\n", .{
         config.discovery_timeout_ms,
         config.latency_pings,
         config.latency_timeout_ms,
@@ -1583,14 +1642,14 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(full_range);
     const all_ips = full_range[0..removeLocalAddrs(full_range)];
 
-    stdout.print("  Total IPs to scan: {d}", .{all_ips.len}) catch {};
+    info_out.print("  Total IPs to scan: {d}", .{all_ips.len}) catch {};
     if (all_ips.len < full_range.len) {
-        stdout.print(" (excluding {d} own address{s})", .{
+        info_out.print(" (excluding {d} own address{s})", .{
             full_range.len - all_ips.len,
             if (full_range.len - all_ips.len == 1) "" else "es",
         }) catch {};
     }
-    stdout.print("\n", .{}) catch {};
+    info_out.print("\n", .{}) catch {};
 
     // Two-phase scanner
     var scanner = Scanner.init(allocator, all_ips, config) catch |err| {
@@ -1601,7 +1660,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer scanner.deinit();
 
-    stdout.print("  Receive timestamps: {s}\n", .{
+    info_out.print("  Receive timestamps: {s}\n", .{
         if (scanner.kernel_ts_enabled) "kernel (SO_TIMESTAMP)" else "userspace (kernel timestamps unavailable)",
     }) catch {};
 
@@ -1613,10 +1672,15 @@ pub fn main(init: std.process.Init) !void {
         }) catch {};
         return runMeshMode(&scanner, allocator, stdout, config);
     }
-    stdout.print("\n", .{}) catch {};
+    info_out.print("\n", .{}) catch {};
 
-    const results = try runScanOnce(&scanner, allocator, stdout);
+    const results = try runScanOnce(&scanner, allocator, info_out);
     defer allocator.free(results);
+
+    if (config.json) {
+        printJson(stdout, results, config);
+        return;
+    }
 
     if (results.len == 0) {
         stdout.print("\n{s}No devices responded. Are you on the right subnet?{s}\n", .{ common.sgr("\x1b[93m"), reset }) catch {};

@@ -264,6 +264,23 @@ pub fn formatLatency(latency_us: ?u64, buf: []u8) []const u8 {
     }
 }
 
+// Minimal JSON string emitter: quotes the value and escapes the quote,
+// backslash, and control bytes. Reverse-DNS names and hostnames are the
+// only externally influenced strings we emit, but they ARE externally
+// influenced — never inline them into JSON unescaped.
+pub fn writeJsonString(w: StdoutWriter, s: []const u8) void {
+    w.writeByte('"') catch {};
+    for (s) |ch| {
+        switch (ch) {
+            '"' => w.writeAll("\\\"") catch {},
+            '\\' => w.writeAll("\\\\") catch {},
+            0x00...0x1F => w.print("\\u{x:0>4}", .{ch}) catch {},
+            else => w.writeByte(ch) catch {},
+        }
+    }
+    w.writeByte('"') catch {};
+}
+
 pub fn displayWidth(s: []const u8) usize {
     // Count display width, accounting for multi-byte UTF-8 and ANSI escape sequences
     var width: usize = 0;
@@ -326,6 +343,13 @@ test "sgr and latencyToColor collapse to nothing when color is disabled" {
     try testing.expectEqualStrings("\x1b[92m", sgr("\x1b[92m"));
     try testing.expectEqualStrings("\x1b[92m", latencyToColor(500));
     try testing.expectEqualStrings("\x1b[90m", latencyToColor(null));
+}
+
+test "writeJsonString escapes quotes, backslashes, and control bytes" {
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    writeJsonString(&w, "a\"b\\c\n");
+    try testing.expectEqualStrings("\"a\\\"b\\\\c\\u000a\"", w.buffered());
 }
 
 test "monotonicMicros is nondecreasing" {
