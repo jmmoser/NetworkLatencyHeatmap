@@ -55,6 +55,22 @@ pub const PingResult = struct {
     sent: u8 = 0, // probes sent to this host in the latency phase
     received: u8 = 0, // probes answered
 
+    // Reverse-DNS name, filled in after the scan (empty = none found)
+    name_buf: [name_max]u8 = @splat(0),
+    name_len: u8 = 0,
+
+    pub const name_max = 32;
+
+    pub fn name(self: *const PingResult) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+
+    pub fn setName(self: *PingResult, n: []const u8) void {
+        const take = @min(n.len, name_max);
+        @memcpy(self.name_buf[0..take], n[0..take]);
+        self.name_len = @intCast(take);
+    }
+
     // Packet loss in percent. A host that answered discovery but none of
     // the latency probes reads as 100%, which is exactly the signal.
     pub fn lossPct(self: *const PingResult) u8 {

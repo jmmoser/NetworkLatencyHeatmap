@@ -307,6 +307,7 @@ const Config = struct {
     mesh: bool = false, // Share results with peers and render the mesh matrix
     mesh_port: u16 = mesh_mod.default_port,
     rescan_interval_s: u32 = 60, // Mesh mode: seconds between scans, 0 = scan once
+    resolve_names: bool = true, // Reverse-DNS discovered hosts (--no-names)
 
     // Extra TCP ping targets (--tcp-ping ip:port): hosts that aren't running
     // this tool but answer a SYN on a known port with SYN-ACK or RST
@@ -1048,6 +1049,20 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
         }
         stdout.print("\n", .{}) catch {};
 
+        // Reverse-DNS names under the IPs, when any host in this band has one
+        var have_names = false;
+        for (results[row_start..row_end]) |r| {
+            if (r.name_len > 0) have_names = true;
+        }
+        if (have_names) {
+            const gray = common.sgr("\x1b[90m");
+            for (results[row_start..row_end]) |r| {
+                const shown = r.name()[0..@min(r.name().len, col_width - 1)];
+                stdout.print("{s}{s}{s}{s}", .{ gray, shown, reset, spaces[0 .. col_width - shown.len] }) catch {};
+            }
+            stdout.print("\n", .{}) catch {};
+        }
+
         // Print heatmap blocks with min/avg/max latency (each colored independently)
         for (results[row_start..row_end]) |r| {
             const block = latencyToBlock(r.latency_avg);
@@ -1169,8 +1184,11 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
         for (slow_devices[0..slow_count]) |r| {
             var ip_buf: [16]u8 = undefined;
             var lat_buf: [16]u8 = undefined;
-            stdout.print("    {s}: {s} avg\n", .{
+            stdout.print("    {s}{s}{s}{s}: {s} avg\n", .{
                 ipToString(r.ip, &ip_buf),
+                if (r.name_len > 0) " (" else "",
+                r.name(),
+                if (r.name_len > 0) ")" else "",
                 formatLatency(r.latency_avg, &lat_buf),
             }) catch {};
         }
@@ -1180,8 +1198,11 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
         stdout.print("\n  {s}⚠ Lossy devices (dropped probes):{s}\n", .{ common.sgr("\x1b[91m"), reset }) catch {};
         for (lossy_devices[0..lossy_count]) |*r| {
             var ip_buf: [16]u8 = undefined;
-            stdout.print("    {s}: {d}% loss ({d}/{d} answered)\n", .{
+            stdout.print("    {s}{s}{s}{s}: {d}% loss ({d}/{d} answered)\n", .{
                 ipToString(r.ip, &ip_buf),
+                if (r.name_len > 0) " (" else "",
+                r.name(),
+                if (r.name_len > 0) ")" else "",
                 r.lossPct(),
                 r.received,
                 r.sent,
@@ -1252,6 +1273,50 @@ fn parseSubnet(arg: []const u8) ?struct { subnet: [4]u8, mask: u8 } {
     return .{ .subnet = u32ToIp(base), .mask = mask };
 }
 
+// Reverse-DNS resolution for scan results, run after measurement so the
+// blocking lookups never sit in the probe path. A small worker pool pulls
+// hosts off a shared counter; workers stop starting new lookups once the
+// soft deadline passes, so an unresponsive DNS server costs seconds, not
+// minutes (one in-flight lookup can still overrun the deadline — pass
+// --no-names when even that is too much).
+const resolve_threads_max = 8;
+const resolve_deadline_us: i64 = 3 * std.time.us_per_s;
+
+const ResolveState = struct {
+    results: []PingResult,
+    next: std.atomic.Value(usize),
+    deadline: i64,
+};
+
+fn resolveWorker(state: *ResolveState) void {
+    while (true) {
+        const i = state.next.fetchAdd(1, .seq_cst);
+        if (i >= state.results.len) return;
+        if (monotonicMicros() > state.deadline) return;
+        var buf: [64]u8 = @splat(0);
+        const r = &state.results[i];
+        const addr_be = std.mem.bytesToValue(u32, &r.ip);
+        if (plat.lookupPtrName(addr_be, &buf)) |n| r.setName(n);
+    }
+}
+
+fn resolveNames(results: []PingResult) void {
+    if (results.len == 0) return;
+    var state = ResolveState{
+        .results = results,
+        .next = std.atomic.Value(usize).init(0),
+        .deadline = monotonicMicros() + resolve_deadline_us,
+    };
+    var threads: [resolve_threads_max]?std.Thread = @splat(null);
+    const n = @min(results.len, resolve_threads_max);
+    for (threads[0..n]) |*t| {
+        t.* = std.Thread.spawn(.{}, resolveWorker, .{&state}) catch null;
+    }
+    for (threads[0..n]) |t| {
+        if (t) |thread| thread.join();
+    }
+}
+
 // Run one full discovery + latency scan. Returns owned results sorted by IP;
 // empty (not an error) when nothing responded, so mesh mode can keep going.
 fn runScanOnce(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWriter) ![]PingResult {
@@ -1269,6 +1334,7 @@ fn runScanOnce(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
     if (results.len > 0) {
         stdout.print("\n", .{}) catch {};
         try scanner.measureLatency(alive_hosts.items, results, stdout);
+        if (scanner.config.resolve_names) resolveNames(results);
     }
     return results;
 }
@@ -1391,6 +1457,9 @@ pub fn main(init: std.process.Init) !void {
                 \\              port (SYN→SYN-ACK, or RST from a closed port — both time
                 \\              the host's stack). Works on devices not running this
                 \\              tool; repeatable, up to 16 targets
+                \\  --no-names  Skip reverse-DNS lookups of discovered hosts (names
+                \\              come from the system resolver after each scan, with a
+                \\              soft time budget so slow DNS can't stall the scanner)
                 \\  --no-color  Disable colored output (also disabled when stdout is
                 \\              not a terminal, or the NO_COLOR env var is set)
                 \\  -h, --help  Show this help
@@ -1430,6 +1499,8 @@ pub fn main(init: std.process.Init) !void {
                 return invalidArgValue("-t", value);
         } else if (std.mem.eql(u8, arg, "--no-color")) {
             no_color = true;
+        } else if (std.mem.eql(u8, arg, "--no-names")) {
+            config.resolve_names = false;
         } else if (std.mem.eql(u8, arg, "--mesh")) {
             config.mesh = true;
         } else if (std.mem.eql(u8, arg, "--mesh-port")) {

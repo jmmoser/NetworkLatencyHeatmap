@@ -412,6 +412,16 @@ const Peer = struct {
     }
 };
 
+// A cached reverse-DNS name for one scanned host
+const NameEntry = struct {
+    buf: [common.PingResult.name_max]u8,
+    len: u8,
+
+    fn name(self: *const NameEntry) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 // TCP RTT results for one peer, produced by the prober thread. Keyed by
 // node id (not a Peer pointer) because the peer list is owned by the main
 // thread and entries can vanish between probe rounds.
@@ -487,6 +497,11 @@ pub const Mesh = struct {
     local_hosts: std.AutoHashMap(u32, HostStats),
     local_entries: std.ArrayList(Entry),
     local_scan_us: i64, // monotonic time of our last scan, 0 = never
+
+    // Reverse-DNS names from our own scans. Names are not gossiped — every
+    // node asks the same resolver anyway — so rows only this node's peers
+    // scanned show as bare IPs.
+    names: std.AutoHashMap(u32, NameEntry),
 
     peers: std.ArrayList(Peer),
 
@@ -602,6 +617,7 @@ pub const Mesh = struct {
             .local_hosts = std.AutoHashMap(u32, HostStats).init(allocator),
             .local_entries = .empty,
             .local_scan_us = 0,
+            .names = std.AutoHashMap(u32, NameEntry).init(allocator),
             .peers = .empty,
             .last_beacon_us = 0,
             .last_gossip_us = 0,
@@ -624,6 +640,7 @@ pub const Mesh = struct {
         self.peers.deinit(self.allocator);
         self.local_hosts.deinit();
         self.local_entries.deinit(self.allocator);
+        self.names.deinit();
         self.poller.deinit();
         if (plat.isValidSocket(self.tcp_listen)) plat.closeSocket(self.tcp_listen);
         plat.closeSocket(self.sock);
@@ -727,6 +744,11 @@ pub const Mesh = struct {
             const ip = ipToU32(r.ip);
             try self.local_hosts.put(ip, stats);
             try self.local_entries.append(self.allocator, .{ .ip = ip, .stats = stats });
+            if (r.name_len > 0) {
+                var ne = NameEntry{ .buf = undefined, .len = r.name_len };
+                @memcpy(ne.buf[0..r.name_len], r.name());
+                try self.names.put(ip, ne);
+            }
         }
 
         self.local_scan_us = monotonicMicros();
@@ -1233,7 +1255,10 @@ pub const Mesh = struct {
             if (row_lossy) lossy_count += 1;
             if (row_samples >= 2 and spreadIsUneven(row_min, row_max)) {
                 uneven_count += 1;
-                stdout.print("{s}◀ uneven{s}", .{ yellow, reset }) catch {};
+                stdout.print("{s}◀ uneven{s} ", .{ yellow, reset }) catch {};
+            }
+            if (self.names.get(ip)) |ne| {
+                stdout.print("{s}{s}{s}", .{ gray, ne.name(), reset }) catch {};
             }
             stdout.print("\n", .{}) catch {};
         }
