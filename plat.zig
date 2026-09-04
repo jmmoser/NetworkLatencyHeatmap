@@ -79,6 +79,17 @@ pub const win = struct {
     pub extern "kernel32" fn SetConsoleOutputCP(wCodePageID: u32) callconv(.winapi) c_int;
     pub extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 
+    pub const COORD = extern struct { X: i16, Y: i16 };
+    pub const SMALL_RECT = extern struct { Left: i16, Top: i16, Right: i16, Bottom: i16 };
+    pub const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
+        dwSize: COORD,
+        dwCursorPosition: COORD,
+        wAttributes: u16,
+        srWindow: SMALL_RECT,
+        dwMaximumWindowSize: COORD,
+    };
+    pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOutput: ?*anyopaque, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) c_int;
+
     // MIB_IPADDRROW from iphlpapi's GetIpAddrTable: one IPv4 address with
     // its netmask per row. Much simpler than GetAdaptersAddresses and
     // carries everything subnet detection needs.
@@ -426,6 +437,16 @@ pub fn windowsSetupConsole() bool {
     _ = win.SetConsoleMode(handle, mode | win.ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     _ = win.SetConsoleOutputCP(win.CP_UTF8);
     return true;
+}
+
+// Visible console width in columns (the window, not the scrollback buffer)
+pub fn windowsConsoleColumns() ?usize {
+    const handle = win.GetStdHandle(win.STD_OUTPUT_HANDLE) orelse return null;
+    var info: win.CONSOLE_SCREEN_BUFFER_INFO = undefined;
+    if (win.GetConsoleScreenBufferInfo(handle, &info) == 0) return null;
+    const cols = @as(i32, info.srWindow.Right) - @as(i32, info.srWindow.Left) + 1;
+    if (cols <= 0) return null;
+    return @intCast(cols);
 }
 
 // IPv4 interface enumeration for Windows via GetIpAddrTable. Rows land in

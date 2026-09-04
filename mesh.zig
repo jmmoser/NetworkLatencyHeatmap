@@ -5,7 +5,8 @@
 // Protocol (UDP, all multi-byte integers little-endian):
 //
 //   Header (all messages, 13 bytes):
-//     [0..4)   magic "NLH1" (protocol version baked into the magic)
+//     [0..4)   magic "NLH2" (protocol version baked into the magic; NLH1
+//              carried 16-byte result entries without the probe counts)
 //     [4]      message type: 1 = beacon, 2 = results chunk
 //     [5..13)  node id (random u64, identifies a scanner instance)
 //
@@ -20,9 +21,10 @@
 //     [17..19) total entries in this result set
 //     [19..21) offset of this chunk's first entry
 //     [21..23) entry count in this chunk
-//     [23..)   entries, 16 bytes each:
+//     [23..)   entries, 18 bytes each:
 //                ip [4]u8 (network order), min/avg/max u32 µs
-//                (0xFFFFFFFF = host discovered but no latency sample)
+//                (0xFFFFFFFF = host discovered but no latency sample),
+//                probes sent u8, probes answered u8 (loss = sent - answered)
 //
 //   Ping / pong (types 3 / 4, unicast, measure node↔node UDP RTT):
 //     [13..21) token u64, opaque to the receiver and echoed back verbatim
@@ -46,27 +48,32 @@
 // probe.zig; the same probe works against hosts not running this tool.
 //
 // Everything received is untrusted input: fixed caps on peers and hosts,
-// strict length checks, unknown magic/type dropped silently. Old nodes
-// drop ping/pong as unknown types, so mixing versions stays harmless.
+// strict length checks, unknown magic/type dropped silently. A node on an
+// older protocol version drops everything from this one (different magic),
+// so mixing versions stays harmless — the nodes just don't see each other.
+//
+// Every node also keeps a rolling history of each vantage point's results
+// (its own scans, and each peer's as their gossip arrives), so the matrix
+// can show a per-host timeline and flag hosts that recently changed.
 const std = @import("std");
 const posix = std.posix;
 const common = @import("common.zig");
 const probe = @import("probe.zig");
 const plat = @import("plat.zig");
+const history = @import("history.zig");
 
 const ipToU32 = common.ipToU32;
 const u32ToIp = common.u32ToIp;
 const ipToString = common.ipToString;
 const formatLatency = common.formatLatency;
 const latencyToColor = common.latencyToColor;
-const latencyToBlock = common.latencyToBlock;
 const displayWidth = common.displayWidth;
 const monotonicMicros = common.monotonicMicros;
 const StdoutWriter = common.StdoutWriter;
 
 pub const default_port: u16 = 47269;
 
-const protocol_magic = [4]u8{ 'N', 'L', 'H', '1' };
+const protocol_magic = [4]u8{ 'N', 'L', 'H', '2' };
 const header_len = 13;
 const beacon_fixed_len = header_len + 7; // + seq, host_count, hostname_len
 const results_fixed_len = header_len + 10; // + seq, total, offset, count
@@ -74,9 +81,9 @@ const ping_len = header_len + 8; // + token
 const links_fixed_len = header_len + 2; // + peer link count, target count
 const link_entry_len = 17; // node id, udp avg, tcp avg, flags
 const target_entry_len = 11; // ip, port, tcp avg, flags
-const entry_len = 16;
+const entry_len = 18;
 const max_hostname = 32;
-const entries_per_chunk = 80; // 80*16 + 23 = 1303 bytes, under typical MTU
+const entries_per_chunk = 80; // 80*18 + 23 = 1463 bytes, under typical MTU
 const recv_buf_len = 2048;
 
 pub const max_peers = 32;
@@ -98,6 +105,8 @@ const tcp_probe_timeout_ms: u32 = probe.default_timeout_ms;
 
 const max_display_rows = 40;
 const max_display_observers = 6;
+const min_strip_width = 12;
+const max_change_lines = 8;
 
 // Sentinel in wire stats: host was discovered but produced no latency sample
 pub const no_data: u32 = 0xFFFF_FFFF;
@@ -106,6 +115,8 @@ pub const HostStats = struct {
     min_us: u32,
     avg_us: u32,
     max_us: u32,
+    sent: u8 = 0, // latency probes sent / answered by the observer
+    received: u8 = 0,
 
     pub fn hasData(self: HostStats) bool {
         return self.avg_us != no_data;
@@ -113,6 +124,16 @@ pub const HostStats = struct {
 
     fn avg(self: HostStats) ?u64 {
         return if (self.hasData()) self.avg_us else null;
+    }
+
+    fn lossPct(self: HostStats) u8 {
+        return self.cell().lossPct();
+    }
+
+    // The same measurement as a history cell (sent 0 would mean "not
+    // discovered", but a gossiped host was discovered, so floor it at 1)
+    fn cell(self: HostStats) history.Cell {
+        return .{ .avg_us = self.avg_us, .sent = @max(self.sent, 1), .received = self.received };
     }
 };
 
@@ -204,6 +225,8 @@ pub fn encodeResultsChunk(buf: []u8, node_id: u64, seq: u32, total: u16, offset:
         std.mem.writeInt(u32, buf[off + 4 ..][0..4], e.stats.min_us, .little);
         std.mem.writeInt(u32, buf[off + 8 ..][0..4], e.stats.avg_us, .little);
         std.mem.writeInt(u32, buf[off + 12 ..][0..4], e.stats.max_us, .little);
+        buf[off + 16] = e.stats.sent;
+        buf[off + 17] = e.stats.received;
         off += entry_len;
     }
     return buf[0..off];
@@ -273,6 +296,8 @@ pub fn decodeEntry(bytes: []const u8) Entry {
             .min_us = std.mem.readInt(u32, bytes[4..8], .little),
             .avg_us = std.mem.readInt(u32, bytes[8..12], .little),
             .max_us = std.mem.readInt(u32, bytes[12..16], .little),
+            .sent = bytes[16],
+            .received = bytes[17],
         },
     };
 }
@@ -342,7 +367,7 @@ pub fn parseMessage(buf: []const u8) ?Parsed {
 // A latency spread across observers is worth flagging when the slowest
 // vantage point sees 3x the fastest AND the gap is more than jitter noise.
 pub fn spreadIsUneven(min_avg: u64, max_avg: u64) bool {
-    return max_avg >= min_avg * 3 and (max_avg - min_avg) > 2000;
+    return history.muchSlower(min_avg, max_avg);
 }
 
 fn medianOfSorted(sorted: []const u64) ?u64 {
@@ -365,7 +390,13 @@ const Peer = struct {
     last_seen_us: i64, // monotonic; peer dropped after peer_timeout_us
     last_results_us: i64, // monotonic; when we last got result data
     results_seq: u32,
+    results_total: u16, // entries the current seq should have
     hosts: std.AutoHashMap(u32, HostStats),
+
+    // This peer's scans over time, one entry per completed result set
+    // (or per superseded partial one, when a chunk never arrived)
+    hist: history.History,
+    hist_seq: u32, // results_seq last pushed into hist
 
     // Node↔node UDP echo RTT, fed by ping/pong on the beacon cadence.
     // A ping still outstanding when the next one goes out counts as a miss.
@@ -382,6 +413,20 @@ const Peer = struct {
 
     fn name(self: *const Peer) []const u8 {
         return self.hostname[0..self.hostname_len];
+    }
+
+    // Record the current result set into this peer's history, once per seq
+    fn commitHistory(self: *Peer, now: i64) void {
+        if (self.hist_seq == self.results_seq) return;
+        // Nothing of a non-empty set arrived: not a record of that scan
+        if (self.hosts.count() == 0 and self.results_total > 0) return;
+        self.hist_seq = self.results_seq;
+        self.hist.beginScan(now);
+        defer self.hist.endScan();
+        var it = self.hosts.iterator();
+        while (it.next()) |kv| {
+            self.hist.record(kv.key_ptr.*, kv.value_ptr.cell()) catch break;
+        }
     }
 
     fn linkTo(self: *const Peer, node_id: u64) ?LinkEntry {
@@ -474,6 +519,7 @@ pub const Mesh = struct {
     local_hosts: std.AutoHashMap(u32, HostStats),
     local_entries: std.ArrayList(Entry),
     local_scan_us: i64, // monotonic time of our last scan, 0 = never
+    local_hist: history.History, // our scans over time
 
     peers: std.ArrayList(Peer),
 
@@ -589,6 +635,7 @@ pub const Mesh = struct {
             .local_hosts = std.AutoHashMap(u32, HostStats).init(allocator),
             .local_entries = .empty,
             .local_scan_us = 0,
+            .local_hist = history.History.init(allocator),
             .peers = .empty,
             .last_beacon_us = 0,
             .last_gossip_us = 0,
@@ -607,9 +654,13 @@ pub const Mesh = struct {
             }
             thread.join();
         }
-        for (self.peers.items) |*p| p.hosts.deinit();
+        for (self.peers.items) |*p| {
+            p.hosts.deinit();
+            p.hist.deinit();
+        }
         self.peers.deinit(self.allocator);
         self.local_hosts.deinit();
+        self.local_hist.deinit();
         self.local_entries.deinit(self.allocator);
         self.poller.deinit();
         if (plat.isValidSocket(self.tcp_listen)) plat.closeSocket(self.tcp_listen);
@@ -708,6 +759,8 @@ pub const Mesh = struct {
                 .min_us = clampStat(r.latency_us),
                 .avg_us = clampStat(r.latency_avg),
                 .max_us = clampStat(r.latency_max),
+                .sent = r.sent,
+                .received = r.received,
             };
             const ip = ipToU32(r.ip);
             try self.local_hosts.put(ip, stats);
@@ -715,6 +768,7 @@ pub const Mesh = struct {
         }
 
         self.local_scan_us = monotonicMicros();
+        try self.local_hist.pushScan(self.local_scan_us, results);
         self.last_gossip_us = 0; // gossip on next pump
         self.dirty = true;
     }
@@ -858,7 +912,10 @@ pub const Mesh = struct {
             .last_seen_us = now,
             .last_results_us = 0,
             .results_seq = 0,
+            .results_total = 0,
             .hosts = std.AutoHashMap(u32, HostStats).init(self.allocator),
+            .hist = history.History.init(self.allocator),
+            .hist_seq = 0,
             .udp_stats = .{},
             .udp_ping_outstanding = false,
             .links = undefined,
@@ -891,9 +948,13 @@ pub const Mesh = struct {
                 if (peer.results_seq != r.seq) {
                     // A new scan from this peer supersedes the old one; the
                     // age shown for this column dates from here, not from
-                    // re-gossips of the same data
+                    // re-gossips of the same data. Whatever we had of the
+                    // old one goes into the history first (a chunk lost
+                    // for good is still that scan's best record).
+                    peer.commitHistory(now);
                     peer.hosts.clearRetainingCapacity();
                     peer.results_seq = r.seq;
+                    peer.results_total = r.total;
                     peer.last_results_us = now;
                 }
                 var off: usize = 0;
@@ -902,6 +963,8 @@ pub const Mesh = struct {
                     const e = decodeEntry(r.entries[off..][0..entry_len]);
                     peer.hosts.put(e.ip, e.stats) catch break;
                 }
+                // Every chunk in: this scan is complete, record it
+                if (peer.hosts.count() >= peer.results_total) peer.commitHistory(now);
                 self.dirty = true;
             },
             .ping => |p| {
@@ -953,6 +1016,7 @@ pub const Mesh = struct {
         while (i < self.peers.items.len) {
             if (now - self.peers.items[i].last_seen_us > peer_timeout_us) {
                 self.peers.items[i].hosts.deinit();
+                self.peers.items[i].hist.deinit();
                 _ = self.peers.swapRemove(i);
                 self.dirty = true;
             } else {
@@ -1073,6 +1137,7 @@ pub const Mesh = struct {
         label_len: usize,
         node_id: u64,
         hosts: *const std.AutoHashMap(u32, HostStats),
+        hist: *const history.History,
         age_us: i64, // since this observer's data was produced/received
 
         fn label(self: *const Observer) []const u8 {
@@ -1080,12 +1145,13 @@ pub const Mesh = struct {
         }
     };
 
-    fn makeObserver(label_text: []const u8, node_id: u64, hosts: *const std.AutoHashMap(u32, HostStats), age_us: i64) Observer {
+    fn makeObserver(label_text: []const u8, node_id: u64, hosts: *const std.AutoHashMap(u32, HostStats), hist: *const history.History, age_us: i64) Observer {
         var o = Observer{
             .label_buf = undefined,
             .label_len = 0,
             .node_id = node_id,
             .hosts = hosts,
+            .hist = hist,
             .age_us = age_us,
         };
         const take = @min(label_text.len, o.label_buf.len);
@@ -1107,10 +1173,7 @@ pub const Mesh = struct {
         var body: std.Io.Writer.Allocating = .init(self.allocator);
         defer body.deinit();
         self.renderBody(&body.writer, now, next_scan_at);
-        var frame: std.Io.Writer.Allocating = .init(self.allocator);
-        defer frame.deinit();
-        common.encodeFrame(&frame.writer, body.written()) catch return;
-        stdout.writeAll(frame.written()) catch {};
+        common.writeFrame(self.allocator, stdout, body.written());
     }
 
     fn renderBody(self: *Mesh, stdout: StdoutWriter, now: i64, next_scan_at: ?i64) void {
@@ -1126,7 +1189,7 @@ pub const Mesh = struct {
         // Assemble the observer columns: self first, then live peers
         var observers: [1 + max_peers]Observer = undefined;
         var num_obs: usize = 0;
-        observers[0] = makeObserver("self", self.node_id, &self.local_hosts, if (self.local_scan_us > 0) now - self.local_scan_us else -1);
+        observers[0] = makeObserver("self", self.node_id, &self.local_hosts, &self.local_hist, if (self.local_scan_us > 0) now - self.local_scan_us else -1);
         num_obs = 1;
         for (self.peers.items) |*p| {
             if (num_obs >= observers.len) break;
@@ -1134,10 +1197,20 @@ pub const Mesh = struct {
             const peer_ip: [4]u8 = @bitCast(p.addr.addr);
             const label_text = if (p.hostname_len > 0) p.name() else ipToString(peer_ip, &ip_buf);
             const age: i64 = if (p.last_results_us > 0) now - p.last_results_us else -1;
-            observers[num_obs] = makeObserver(label_text, p.node_id, &p.hosts, age);
+            observers[num_obs] = makeObserver(label_text, p.node_id, &p.hosts, &p.hist, age);
             num_obs += 1;
         }
         const shown_obs = @min(num_obs, max_display_observers);
+
+        // A timeline strip per row (our own scans over time) takes the
+        // width the terminal has left after the observer columns; dropped
+        // entirely when there is no room for a useful one
+        const uneven_width = 9;
+        const used: usize = 2 + label_width + @as(usize, shown_obs) * col_width + uneven_width;
+        const strip_width: usize = if (common.termColumns() >= used + min_strip_width)
+            @min(history.max_scans, common.termColumns() - used)
+        else
+            0;
 
         // Row set: every host any observer has measured
         var row_set = std.AutoHashMap(u32, void).init(self.allocator);
@@ -1182,7 +1255,12 @@ pub const Mesh = struct {
             stdout.print("{s}{s}{s}{s}", .{ bold, l, reset, pad[0 .. col_width - l.len] }) catch {};
         }
         if (num_obs > shown_obs) {
-            stdout.print("{s}+{d} more{s}", .{ gray, num_obs - shown_obs, reset }) catch {};
+            stdout.print("{s}+{d} more{s}{s}", .{ gray, num_obs - shown_obs, reset, pad[0..uneven_width -| (num_obs - shown_obs + 7)] }) catch {};
+        } else {
+            stdout.print("{s}", .{pad[0..uneven_width]}) catch {};
+        }
+        if (strip_width > 0) {
+            stdout.print("{s}self, per scan{s}", .{ bold, reset }) catch {};
         }
         stdout.print("\n  {s}", .{pad[0..label_width]}) catch {};
         for (observers[0..shown_obs]) |*o| {
@@ -1192,6 +1270,11 @@ pub const Mesh = struct {
             else
                 std.fmt.bufPrint(&age_buf, "{d}s ago", .{@divFloor(o.age_us, std.time.us_per_s)}) catch "?";
             stdout.print("{s}{s}{s}{s}", .{ gray, age_str, reset, pad[0 .. col_width - age_str.len] }) catch {};
+        }
+        if (strip_width > 0) {
+            stdout.print("{s}{s}", .{ pad[0..uneven_width], gray }) catch {};
+            history.writeRuler(stdout, &self.local_hist, now, strip_width, 10);
+            stdout.print("{s}", .{reset}) catch {};
         }
         stdout.print("\n", .{}) catch {};
 
@@ -1216,15 +1299,25 @@ pub const Mesh = struct {
                 }
                 var lat_buf: [16]u8 = undefined;
                 const lat_str = formatLatency(avg, &lat_buf);
-                const color = latencyToColor(avg);
-                const block = latencyToBlock(avg);
-                stdout.print("{s}{s} {s}{s}", .{ color, block, lat_str, reset }) catch {};
-                const used = 2 + displayWidth(lat_str);
-                stdout.print("{s}", .{pad[0..@max(1, col_width - @min(used, col_width - 1))]}) catch {};
+                // Glyph and color show the worse of latency and loss
+                const tier: history.Tier = if (stats) |s| history.cellTier(s.cell()) else .absent;
+                var cell_buf: [32]u8 = undefined;
+                const cell_str = if (stats != null and stats.?.lossPct() > 0)
+                    std.fmt.bufPrint(&cell_buf, "{s} ✗{d}%", .{ lat_str, stats.?.lossPct() }) catch lat_str
+                else
+                    lat_str;
+                stdout.print("{s}{s} {s}{s}", .{ tier.color(), tier.glyph(), cell_str, reset }) catch {};
+                const cell_used = 2 + displayWidth(cell_str);
+                stdout.print("{s}", .{pad[0..@max(1, col_width - @min(cell_used, col_width - 1))]}) catch {};
             }
             if (row_samples >= 2 and spreadIsUneven(row_min, row_max)) {
                 uneven_count += 1;
-                stdout.print("{s}◀ uneven{s}", .{ yellow, reset }) catch {};
+                stdout.print("{s}◀ uneven{s} ", .{ yellow, reset }) catch {};
+            } else if (strip_width > 0) {
+                stdout.print("{s}", .{pad[0..uneven_width]}) catch {};
+            }
+            if (strip_width > 0) {
+                history.writeStrip(stdout, self.local_hist.get(ip), strip_width);
             }
             stdout.print("\n", .{}) catch {};
         }
@@ -1232,7 +1325,13 @@ pub const Mesh = struct {
             stdout.print("  {s}... +{d} more targets{s}\n", .{ gray, rows.items.len - shown_rows, reset }) catch {};
         }
 
-        stdout.print("\n  {s}avg latency as seen from each observer · {s}◀ uneven{s}{s} = slowest vantage ≥3x fastest{s}\n", .{ gray, yellow, reset, gray, reset }) catch {};
+        stdout.print("\n  {s}avg latency as seen from each observer, ✗ = probe loss · {s}◀ uneven{s}{s} = slowest vantage ≥3x fastest{s}", .{ gray, yellow, reset, gray, reset }) catch {};
+        if (strip_width > 0) {
+            stdout.print("{s} · strip = our own scans over time, oldest left{s}", .{ gray, reset }) catch {};
+        }
+        stdout.print("\n  {s}Legend:{s} ", .{ bold, reset }) catch {};
+        history.writeLegend(stdout);
+        stdout.print("\n", .{}) catch {};
 
         self.renderLinks(stdout, observers[0..num_obs], shown_obs);
         self.renderInsights(stdout, observers[0..num_obs], rows.items, uneven_count);
@@ -1433,6 +1532,7 @@ pub const Mesh = struct {
     fn renderInsights(self: *Mesh, stdout: StdoutWriter, observers: []const Observer, rows: []const u32, uneven_count: usize) void {
         const reset = common.sgr("\x1b[0m");
         const yellow = common.sgr("\x1b[93m");
+        const bold = common.sgr("\x1b[1m");
         var all_avgs: std.ArrayList(u64) = .empty;
         defer all_avgs.deinit(self.allocator);
         var col_medians: [1 + max_peers]?u64 = @splat(null);
@@ -1480,6 +1580,26 @@ pub const Mesh = struct {
                 if (uneven_count == 1) "" else "s",
             }) catch {};
         }
+
+        // Hosts that recently departed from their own baseline, from any
+        // vantage point — the time axis's payoff: not just what is slow,
+        // but since when, and whether every observer saw it happen
+        const now = monotonicMicros();
+        var remaining: usize = max_change_lines;
+        var printed_changes = false;
+        for (observers) |*o| {
+            if (remaining == 0) break;
+            var changes: [max_change_lines]history.Change = undefined;
+            const n = o.hist.changes(now, changes[0..remaining]);
+            if (n == 0) continue;
+            if (!printed_changes) {
+                stdout.print("\n  {s}⚠ Changes:{s}\n", .{ yellow, reset }) catch {};
+                printed_changes = true;
+            }
+            stdout.print("    seen from {s}{s}{s}:\n", .{ bold, o.label(), reset }) catch {};
+            history.writeChanges(stdout, changes[0..n], "      ");
+            remaining -= n;
+        }
     }
 };
 
@@ -1505,8 +1625,8 @@ test "beacon encode truncates an oversized hostname" {
 
 test "results chunk round-trips including the no-data sentinel" {
     const entries = [_]Entry{
-        .{ .ip = ipToU32(.{ 192, 168, 1, 1 }), .stats = .{ .min_us = 100, .avg_us = 250, .max_us = 900 } },
-        .{ .ip = ipToU32(.{ 192, 168, 1, 7 }), .stats = .{ .min_us = no_data, .avg_us = no_data, .max_us = no_data } },
+        .{ .ip = ipToU32(.{ 192, 168, 1, 1 }), .stats = .{ .min_us = 100, .avg_us = 250, .max_us = 900, .sent = 5, .received = 4 } },
+        .{ .ip = ipToU32(.{ 192, 168, 1, 7 }), .stats = .{ .min_us = no_data, .avg_us = no_data, .max_us = no_data, .sent = 5, .received = 0 } },
     };
     var buf: [results_fixed_len + entries_per_chunk * entry_len]u8 = undefined;
     const msg = encodeResultsChunk(&buf, 99, 3, 10, 4, &entries);
@@ -1521,10 +1641,15 @@ test "results chunk round-trips including the no-data sentinel" {
     try testing.expectEqual(entries[0].ip, e0.ip);
     try testing.expectEqual(@as(u32, 250), e0.stats.avg_us);
     try testing.expect(e0.stats.hasData());
+    try testing.expectEqual(@as(u8, 5), e0.stats.sent);
+    try testing.expectEqual(@as(u8, 4), e0.stats.received);
+    try testing.expectEqual(@as(u8, 20), e0.stats.lossPct());
 
     const e1 = decodeEntry(parsed.results.entries[entry_len .. 2 * entry_len]);
     try testing.expectEqual(entries[1].ip, e1.ip);
     try testing.expect(!e1.stats.hasData());
+    try testing.expectEqual(@as(u8, 100), e1.stats.lossPct());
+    try testing.expectEqual(history.Tier.dead, history.cellTier(e1.stats.cell()));
 }
 
 test "ping and pong round-trip through encode and parse" {
@@ -1607,7 +1732,7 @@ test "parseMessage rejects malformed datagrams" {
 
     // Wrong magic/version
     var bad_magic: [beacon_fixed_len]u8 = @splat(0);
-    @memcpy(bad_magic[0..4], "NLH2");
+    @memcpy(bad_magic[0..4], "NLH1");
     bad_magic[4] = 1;
     try testing.expect(parseMessage(&bad_magic) == null);
 

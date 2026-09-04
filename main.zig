@@ -4,6 +4,7 @@ const c = std.c;
 const builtin = @import("builtin");
 const common = @import("common.zig");
 const mesh_mod = @import("mesh.zig");
+const history = @import("history.zig");
 const probe = @import("probe.zig");
 const plat = @import("plat.zig");
 
@@ -18,7 +19,6 @@ const wallMicros = common.wallMicros;
 const sleepNanos = common.sleepNanos;
 const ipToString = common.ipToString;
 const latencyToColor = common.latencyToColor;
-const latencyToBlock = common.latencyToBlock;
 const formatLatency = common.formatLatency;
 const displayWidth = common.displayWidth;
 
@@ -306,12 +306,18 @@ const Config = struct {
     latency_timeout_ms: u32 = 1000, // Timeout per ping in latency phase
     mesh: bool = false, // Share results with peers and render the mesh matrix
     mesh_port: u16 = mesh_mod.default_port,
-    rescan_interval_s: u32 = 60, // Mesh mode: seconds between scans, 0 = scan once
+    // Seconds between scans (-i); 0 = scan once. Unset means the mode's
+    // default: once standalone, every 60s in mesh mode
+    rescan_interval_s: ?u32 = null,
 
     // Extra TCP ping targets (--tcp-ping ip:port): hosts that aren't running
     // this tool but answer a SYN on a known port with SYN-ACK or RST
     tcp_targets: [probe.max_targets]probe.TcpTarget = undefined,
     tcp_target_count: usize = 0,
+
+    fn rescanInterval(self: Config) u32 {
+        return self.rescan_interval_s orelse (if (self.mesh) 60 else 0);
+    }
 };
 
 // Per-host latency samples collected during Phase 2
@@ -748,6 +754,8 @@ const Scanner = struct {
                 .latency_us = null,
                 .latency_avg = null,
                 .latency_max = null,
+                .sent = 0,
+                .received = 0,
             };
         }
 
@@ -856,6 +864,7 @@ const Scanner = struct {
                 );
 
                 last_send_time = send_time.mono;
+                results[host_idx].sent += 1;
 
                 // Advance to next ping
                 next_send_host += 1;
@@ -930,6 +939,7 @@ const Scanner = struct {
 
                     const latency: u64 = @intCast(@max(0, rtt));
                     latencies[host_idx].add(latency);
+                    results[host_idx].received += 1;
                     received[ping_idx] = true;
                     responses_received += 1;
                     last_response_time = recv_mono;
@@ -1028,8 +1038,11 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
 
         // Print heatmap blocks with min/avg/max latency (each colored independently)
         for (results[row_start..row_end]) |r| {
-            const block = latencyToBlock(r.latency_avg);
-            const block_color = latencyToColor(r.latency_avg);
+            // Cell severity is the worse of latency and loss, so a host
+            // dropping most probes isn't painted green by the few replies
+            const tier = history.cellTier(history.cellFromResult(r));
+            const block = tier.glyph();
+            const block_color = tier.color();
             var min_buf: [16]u8 = undefined;
             var avg_buf: [16]u8 = undefined;
             var max_buf: [16]u8 = undefined;
@@ -1038,17 +1051,26 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
             const max_str = formatLatency(r.latency_max, &max_buf);
 
             // Format: "█ min/avg/max" with each value colored independently
-            var lat_combined: [128]u8 = undefined;
+            var lat_combined: [160]u8 = undefined;
+            var loss_buf: [24]u8 = undefined;
+            const loss_str = if (r.lossPct() > 0)
+                std.fmt.bufPrint(&loss_buf, " {s}✗{d}%{s}", .{ history.lossTier(r.lossPct()).color(), r.lossPct(), reset }) catch ""
+            else
+                "";
             const combined_str = if (r.latency_us != null) blk: {
                 const min_color = latencyToColor(r.latency_us);
                 const avg_color = latencyToColor(r.latency_avg);
                 const max_color = latencyToColor(r.latency_max);
-                break :blk std.fmt.bufPrint(&lat_combined, "{s}{s}{s}/{s}{s}{s}/{s}{s}{s}", .{
+                break :blk std.fmt.bufPrint(&lat_combined, "{s}{s}{s}/{s}{s}{s}/{s}{s}{s}{s}", .{
                     min_color, min_str, reset,
                     avg_color, avg_str, reset,
                     max_color, max_str, reset,
+                    loss_str,
                 }) catch "???";
-            } else "---";
+            } else if (r.sent > 0)
+                std.fmt.bufPrint(&lat_combined, "no reply{s}", .{loss_str}) catch "???"
+            else
+                "---";
 
             stdout.print("{s}{s}{s} {s}", .{ block_color, block, reset, combined_str }) catch {};
             // 2 display chars for "█ ", rest is latency string (use display width for proper alignment)
@@ -1069,8 +1091,14 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
     var worst_avg: u64 = 0;
     var slow_devices: [10]PingResult = undefined;
     var slow_count: usize = 0;
+    var lossy_devices: [10]PingResult = undefined;
+    var lossy_count: usize = 0;
 
     for (results) |r| {
+        if (r.lossPct() > 0 and lossy_count < 10) {
+            lossy_devices[lossy_count] = r;
+            lossy_count += 1;
+        }
         if (r.latency_avg) |avg_lat| {
             alive_count += 1;
             total_avg_latency += avg_lat;
@@ -1122,18 +1150,27 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult) void {
         }
     }
 
+    if (lossy_count > 0) {
+        stdout.print("\n  {s}⚠ Packet loss:{s}\n", .{ common.sgr("\x1b[91m"), reset }) catch {};
+        for (lossy_devices[0..lossy_count]) |r| {
+            var ip_buf: [16]u8 = undefined;
+            stdout.print("    {s}: {d}% ({d} of {d} probes unanswered)\n", .{
+                ipToString(r.ip, &ip_buf),
+                r.lossPct(),
+                r.sent - @min(r.sent, r.received),
+                r.sent,
+            }) catch {};
+        }
+    }
+
     stdout.print("\n{s}══════════════════════════════════════════════════════════════{s}\n", .{ bold, reset }) catch {};
 }
 
 fn printLegend(stdout: StdoutWriter) void {
     const reset = common.sgr("\x1b[0m");
     stdout.print("\n{s}Legend:{s} ", .{ common.sgr("\x1b[1m"), reset }) catch {};
-    stdout.print("{s}█ <1ms{s}  ", .{ common.sgr("\x1b[92m"), reset }) catch {};
-    stdout.print("{s}▓ <5ms{s}  ", .{ common.sgr("\x1b[32m"), reset }) catch {};
-    stdout.print("{s}▒ <20ms{s}  ", .{ common.sgr("\x1b[93m"), reset }) catch {};
-    stdout.print("{s}░ <100ms{s}  ", .{ common.sgr("\x1b[33m"), reset }) catch {};
-    stdout.print("{s}▪ >100ms{s}  ", .{ common.sgr("\x1b[91m"), reset }) catch {};
-    stdout.print("{s}· offline{s}\n", .{ common.sgr("\x1b[90m"), reset }) catch {};
+    history.writeLegend(stdout);
+    stdout.print("\n", .{}) catch {};
 }
 
 fn printProgress(stdout: StdoutWriter, done: usize, total: usize) void {
@@ -1237,7 +1274,7 @@ fn runMeshMode(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
         scanner.tick_ctx = null;
     }
 
-    const rescan_us: i64 = @as(i64, config.rescan_interval_s) * std.time.us_per_s;
+    const rescan_us: i64 = @as(i64, config.rescanInterval()) * std.time.us_per_s;
     var next_scan_at: i64 = monotonicMicros(); // first scan runs immediately
 
     while (true) {
@@ -1256,6 +1293,182 @@ fn runMeshMode(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
         // Sleep until mesh traffic arrives or a short tick elapses
         _ = mesh.poller.wait(100);
     }
+}
+
+// Standalone watch mode (-i without --mesh): rescan on an interval, keep a
+// rolling history per host, and render it as a timeline — every host as a
+// strip of cells, one per scan, so a host that degraded three minutes ago
+// looks different from one that has always been slow. Runs until
+// interrupted. On a TTY the view is redrawn in place; piped, each scan
+// appends one snapshot.
+fn runWatchMode(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWriter, config: Config) !void {
+    var hist = history.History.init(allocator);
+    defer hist.deinit();
+
+    const rescan_us: i64 = @as(i64, config.rescanInterval()) * std.time.us_per_s;
+    const started_us = monotonicMicros();
+
+    while (true) {
+        const results = try runScanOnce(scanner, allocator, stdout);
+        defer allocator.free(results);
+        try hist.pushScan(monotonicMicros(), results);
+        const next_scan_at = monotonicMicros() + rescan_us;
+
+        // Render, then tick the countdown once a second on a TTY (the frame
+        // is overwritten in place); piped output gets one snapshot per scan
+        var last_countdown: i64 = -1;
+        while (true) {
+            const now = monotonicMicros();
+            const remaining = next_scan_at - now;
+            const countdown_s = @max(0, @divFloor(remaining, std.time.us_per_s));
+            if (countdown_s != last_countdown and (common.stdout_is_tty or last_countdown < 0)) {
+                last_countdown = countdown_s;
+                renderTimeline(allocator, stdout, &hist, now, started_us, next_scan_at, config);
+            }
+            if (remaining <= 0) break;
+            common.sleepNanos(@intCast(@min(remaining, 250 * std.time.us_per_ms) * std.time.ns_per_us));
+        }
+    }
+}
+
+fn renderTimeline(allocator: std.mem.Allocator, stdout: StdoutWriter, hist: *const history.History, now: i64, started_us: i64, next_scan_at: i64, config: Config) void {
+    if (!common.stdout_is_tty) {
+        writeTimeline(allocator, stdout, hist, now, started_us, next_scan_at, config);
+        return;
+    }
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    defer body.deinit();
+    writeTimeline(allocator, &body.writer, hist, now, started_us, next_scan_at, config);
+    common.writeFrame(allocator, stdout, body.written());
+}
+
+const timeline_max_rows = 60;
+const timeline_max_changes = 8;
+
+fn writeTimeline(allocator: std.mem.Allocator, out: StdoutWriter, hist: *const history.History, now: i64, started_us: i64, next_scan_at: i64, config: Config) void {
+    const reset = common.sgr("\x1b[0m");
+    const bold = common.sgr("\x1b[1m");
+    const gray = common.sgr("\x1b[90m");
+    const cyan = common.sgr("\x1b[96m");
+    const yellow = common.sgr("\x1b[93m");
+    const pad = " " ** 32;
+
+    // Layout: "  host  [strip]  now  avg/worst  loss", the strip taking
+    // whatever the terminal has left (at most one column per stored scan)
+    const label_width = 17;
+    const now_width = 12;
+    const range_width = 16;
+    const loss_width = 5;
+    const fixed = 2 + label_width + now_width + range_width + loss_width;
+    const cols = common.termColumns();
+    const strip_width: usize = @min(history.max_scans, @max(10, cols -| fixed));
+
+    // Rows: every host in the window, by IP
+    var rows: std.ArrayList(u32) = .empty;
+    defer rows.deinit(allocator);
+    var kit = hist.hosts.keyIterator();
+    while (kit.next()) |k| rows.append(allocator, k.*) catch {};
+    std.mem.sort(u32, rows.items, {}, std.sort.asc(u32));
+
+    var alive: usize = 0;
+    for (rows.items) |ip| {
+        const h = hist.get(ip) orelse continue;
+        if (h.latest()) |newest| {
+            if (newest.sent > 0) alive += 1;
+        }
+    }
+
+    out.print("{s}╔══════════════════════════════════════════════════════════════╗{s}\n", .{ cyan, reset }) catch {};
+    out.print("{s}║{s}             {s}Network Latency Timeline{s}                         {s}║{s}\n", .{ cyan, reset, bold, reset, cyan, reset }) catch {};
+    out.print("{s}╚══════════════════════════════════════════════════════════════╝{s}\n\n", .{ cyan, reset }) catch {};
+
+    var up_buf: [16]u8 = undefined;
+    var clock_buf: [16]u8 = undefined;
+    const uptime = history.formatAgo(now - started_us, &up_buf)[1..]; // drop the leading '-'
+    out.print("  {d}.{d}.{d}.{d}/{d} · scan #{d} every {d}s · {d} host{s} up of {d} seen · running {s} · {s}\n", .{
+        config.subnet[0],
+        config.subnet[1],
+        config.subnet[2],
+        config.subnet[3],
+        config.mask_bits,
+        hist.scan_count,
+        config.rescanInterval(),
+        alive,
+        if (alive == 1) "" else "s",
+        rows.items.len,
+        uptime,
+        formatClock(&clock_buf),
+    }) catch {};
+    out.print("  Next rescan in {d}s\n\n", .{@max(0, @divFloor(next_scan_at - now, std.time.us_per_s))}) catch {};
+
+    // Header: column titles, with the time ruler over the strip
+    out.print("  {s}host{s}{s}", .{ bold, reset, pad[0 .. label_width - 4] }) catch {};
+    out.print("{s}", .{gray}) catch {};
+    history.writeRuler(out, hist, now, strip_width, 10);
+    out.print("{s}", .{reset}) catch {};
+    out.print("  {s}now{s}{s}", .{ bold, reset, pad[0 .. now_width - 3] }) catch {};
+    out.print("{s}avg/worst{s}{s}", .{ bold, reset, pad[0 .. range_width - 9] }) catch {};
+    out.print("{s}loss{s}\n", .{ bold, reset }) catch {};
+
+    const shown_rows = @min(rows.items.len, timeline_max_rows);
+    for (rows.items[0..shown_rows]) |ip| {
+        const h = hist.get(ip) orelse continue;
+        var ip_buf: [16]u8 = undefined;
+        const ip_str = ipToString(u32ToIp(ip), &ip_buf);
+        out.print("  {s}{s}", .{ ip_str, pad[0 .. label_width - ip_str.len] }) catch {};
+        history.writeStrip(out, h, strip_width);
+
+        // Newest cell: glyph and latency
+        const newest = h.latest() orelse history.Cell.absent;
+        const tier = history.cellTier(newest);
+        var now_buf: [16]u8 = undefined;
+        const now_str = if (newest.sent == 0)
+            "gone"
+        else if (newest.avg() == null)
+            "no reply"
+        else
+            formatLatency(newest.avg(), &now_buf);
+        out.print("  {s}{s} {s}{s}{s}", .{ tier.color(), tier.glyph(), now_str, reset, pad[0..now_width -| (3 + displayWidth(now_str))] }) catch {};
+
+        // Window aggregates
+        const w = h.window();
+        var avg_buf: [16]u8 = undefined;
+        var worst_buf: [16]u8 = undefined;
+        var range_buf: [40]u8 = undefined;
+        const range_str = if (w.samples > 0)
+            std.fmt.bufPrint(&range_buf, "{s}/{s}", .{ formatLatency(w.avg_us, &avg_buf), formatLatency(w.worst_us, &worst_buf) }) catch "?"
+        else
+            "---";
+        out.print("{s}{s}", .{ range_str, pad[0..range_width -| displayWidth(range_str)] }) catch {};
+        const loss = w.lossPct();
+        out.print("{s}{d}%{s}\n", .{ if (loss > 0) history.lossTier(loss).color() else "", loss, reset }) catch {};
+    }
+    if (rows.items.len > shown_rows) {
+        out.print("  {s}... +{d} more hosts{s}\n", .{ gray, rows.items.len - shown_rows, reset }) catch {};
+    }
+
+    out.print("\n  {s}Legend:{s} ", .{ bold, reset }) catch {};
+    history.writeLegend(out);
+    out.print("\n  {s}each cell is one scan, oldest left, showing the worse of latency and loss · avg/worst and loss cover the whole window{s}\n", .{ gray, reset }) catch {};
+
+    var changes: [timeline_max_changes]history.Change = undefined;
+    const n = hist.changes(now, &changes);
+    if (n > 0) {
+        out.print("\n  {s}⚠ Changes:{s}\n", .{ yellow, reset }) catch {};
+        history.writeChanges(out, changes[0..n], "    ");
+    }
+}
+
+// Wall clock as HH:MM:SS UTC, so piped snapshots carry an absolute time
+fn formatClock(buf: []u8) []const u8 {
+    const secs: u64 = @intCast(@max(0, @divFloor(wallMicros(), std.time.us_per_s)));
+    const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
+    const day = epoch.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        day.getHoursIntoDay(),
+        day.getMinutesIntoHour(),
+        day.getSecondsIntoMinute(),
+    }) catch "?";
 }
 
 fn nextArgValue(args: []const [:0]const u8, i: *usize) []const u8 {
@@ -1318,8 +1531,11 @@ pub fn main(init: std.process.Init) !void {
                 \\              every host's latency from every vantage point
                 \\  --mesh-port <port>  UDP+TCP port for mesh discovery, gossip, and
                 \\              node-to-node probes (default: 47269)
-                \\  -i <sec>    Mesh mode: rescan interval in seconds, 0 = scan once
-                \\              (default: 60)
+                \\  -i <sec>    Rescan every <sec> seconds and keep a rolling history:
+                \\              standalone this renders a live timeline (one cell per
+                \\              scan per host, so you can see *when* a host went bad);
+                \\              in mesh mode it is the rescan interval. 0 = scan once
+                \\              (default: 0 standalone, 60 with --mesh)
                 \\  --tcp-ping <ip:port>  Mesh mode: also TCP-ping this host on a known
                 \\              port (SYN→SYN-ACK, or RST from a closed port — both time
                 \\              the host's stack). Works on devices not running this
@@ -1470,10 +1686,17 @@ pub fn main(init: std.process.Init) !void {
     if (config.mesh) {
         stdout.print("  Mesh: UDP port {d}, rescan interval {d}s{s}\n\n", .{
             config.mesh_port,
-            config.rescan_interval_s,
-            if (config.rescan_interval_s == 0) " (scan once)" else "",
+            config.rescanInterval(),
+            if (config.rescanInterval() == 0) " (scan once)" else "",
         }) catch {};
         return runMeshMode(&scanner, allocator, stdout, config);
+    }
+    if (config.rescanInterval() > 0) {
+        stdout.print("  Watch: rescanning every {d}s, keeping the last {d} scans per host\n\n", .{
+            config.rescanInterval(),
+            history.max_scans,
+        }) catch {};
+        return runWatchMode(&scanner, allocator, stdout, config);
     }
     stdout.print("\n", .{}) catch {};
 
@@ -1614,6 +1837,41 @@ test "kernel_ts.parse rejects empty, truncated, and mismatched buffers" {
     };
     @memcpy(&lying, std.mem.asBytes(&bad));
     try testing.expectEqual(@as(?i64, null), kernel_ts.parse(&lying));
+}
+
+test "writeTimeline renders a row per host with strip, window stats, and changes" {
+    common.color_enabled = false;
+    common.stdout_is_tty = false;
+    var hist = history.History.init(testing.allocator);
+    defer hist.deinit();
+
+    const steady = [4]u8{ 10, 0, 0, 1 };
+    const flaky = [4]u8{ 10, 0, 0, 2 };
+    var t: i64 = 0;
+    for (0..8) |i| {
+        t += 10 * std.time.us_per_s;
+        const flaky_ok = i < 6;
+        const results = [_]PingResult{
+            .{ .ip = steady, .latency_us = 400, .latency_avg = 500, .latency_max = 700, .sent = 5, .received = 5 },
+            .{ .ip = flaky, .latency_us = 800, .latency_avg = if (flaky_ok) 900 else 30_000, .latency_max = 1200, .sent = 5, .received = 5 },
+        };
+        try hist.pushScan(t, &results);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const config = Config{ .subnet = .{ 10, 0, 0, 0 }, .mask_bits = 24, .rescan_interval_s = 10 };
+    writeTimeline(testing.allocator, &out.writer, &hist, t, 0, t + 10 * std.time.us_per_s, config);
+    const text = out.written();
+
+    try testing.expect(std.mem.indexOf(u8, text, "scan #8 every 10s · 2 hosts up of 2 seen") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "10.0.0.1         ") != null);
+    // Steady host: eight excellent cells, window avg/worst, no loss
+    try testing.expect(std.mem.indexOf(u8, text, "████████  █ 500µs    500µs/500µs     0%") != null);
+    // Flaky host: six excellent cells then two slow ones
+    try testing.expect(std.mem.indexOf(u8, text, "██████░░  ░ 30.0ms   8.2ms/30.0ms    0%") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "⚠ Changes:") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "10.0.0.2 degraded 10s ago: 30.0ms now vs 900µs usually") != null);
 }
 
 test "LatencyData caps samples and computes min/avg/max" {

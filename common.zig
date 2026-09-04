@@ -33,6 +33,29 @@ pub fn initTerm(no_color_flag: bool) void {
     color_enabled = stdout_is_tty and !no_color_flag and !no_color_set;
 }
 
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+// Width of the terminal on stdout in columns, for views that size a
+// timeline strip to the screen. Falls back to $COLUMNS, then 80 (also when
+// stdout is not a terminal, so piped output gets a fixed, stable width).
+pub fn termColumns() usize {
+    const fallback = 80;
+    if (stdout_is_tty) {
+        if (plat.is_windows) {
+            if (plat.windowsConsoleColumns()) |cols| return cols;
+        } else {
+            var ws: posix.winsize = undefined;
+            const req: c_int = @bitCast(@as(u32, @intCast(c.T.IOCGWINSZ)));
+            if (c.ioctl(posix.STDOUT_FILENO, req, &ws) == 0 and ws.col > 0) return ws.col;
+        }
+    }
+    if (getenv("COLUMNS")) |v| {
+        const cols = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return fallback;
+        if (cols > 0) return cols;
+    }
+    return fallback;
+}
+
 // Gate an ANSI SGR escape on color support: returns the code unchanged when
 // color is enabled, "" otherwise. Call sites format with {s} so disabled
 // colors collapse to nothing.
@@ -51,6 +74,14 @@ pub const PingResult = struct {
     latency_us: ?u64, // microseconds, null if timeout (min latency)
     latency_avg: ?u64, // average latency
     latency_max: ?u64, // max latency
+    sent: u8 = 0, // latency-phase probes sent to this host
+    received: u8 = 0, // ... and answered; sent - received is the loss
+
+    pub fn lossPct(self: PingResult) u8 {
+        if (self.sent == 0) return 0;
+        const lost: u32 = self.sent - @min(self.sent, self.received);
+        return @intCast(lost * 100 / self.sent);
+    }
 };
 
 // Platform-agnostic event poller for socket readiness
@@ -259,6 +290,15 @@ pub fn encodeFrame(out: *std.Io.Writer, body: []const u8) !void {
     }
     try out.writeAll(rest);
     try out.writeAll("\x1b[0J\x1b[?25h\x1b[?2026l");
+}
+
+// Emit a composed body as one in-place frame (see encodeFrame), as a
+// single write
+pub fn writeFrame(allocator: std.mem.Allocator, stdout: StdoutWriter, body: []const u8) void {
+    var frame: std.Io.Writer.Allocating = .init(allocator);
+    defer frame.deinit();
+    encodeFrame(&frame.writer, body) catch return;
+    stdout.writeAll(frame.written()) catch {};
 }
 
 pub fn displayWidth(s: []const u8) usize {

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/jmmoser/NetworkLatencyHeatmap/actions/workflows/ci.yml/badge.svg)](https://github.com/jmmoser/NetworkLatencyHeatmap/actions/workflows/ci.yml)
 
-A fast network scanner that discovers hosts on your network and measures their latency, displaying results as a visual heatmap.
+A fast network scanner that discovers hosts on your network and measures their latency, displaying results as a visual heatmap — and, in watch mode, as a timeline: one cell per host per scan, so you can see *when* a host went bad, not just that it is bad now.
 
 ## Features
 
@@ -11,6 +11,9 @@ A fast network scanner that discovers hosts on your network and measures their l
 - **Kernel receive timestamps**: Uses `SO_TIMESTAMP` on Linux and macOS so replies are stamped by the kernel on arrival — process wakeup and scheduling delay don't inflate measured RTTs (falls back to userspace timestamps where unavailable, including on Windows)
 - **Monotonic timing**: All pacing, timeouts, and fallback measurements use `CLOCK_MONOTONIC` (`QueryPerformanceCounter` on Windows); kernel stamps (wall clock only) are cross-checked against a monotonic upper bound, so an NTP step or slew mid-scan can't corrupt samples or stall the scanner
 - **Visual heatmap**: Color-coded latency display to quickly identify slow devices
+- **Time axis**: `-i <sec>` rescans on an interval and keeps the last 120 scans per host, rendered as a live timeline strip per host (oldest left, newest right) with a time ruler, window averages, and packet loss — intermittent problems that a single snapshot can never catch become a visible pattern
+- **Packet loss**: Every scan records probes sent and answered per host; a cell is colored by the worse of latency and loss, so a host answering 2 of 5 probes at 1ms is not painted healthy green
+- **Change detection**: Each host is compared against its own baseline (the median of its earlier scans), and the view names the hosts that degraded, started dropping probes, went offline, or newly appeared — and since when
 - **Flicker-free live view**: the mesh matrix never clears the screen between frames — each redraw overwrites the previous frame in place (erasing only stale line tails and leftover rows), is emitted as a single write, and is wrapped in terminal synchronized output (mode 2026) so capable terminals commit it atomically
 - **Concurrent scanning**: Uses separate sender/receiver threads for maximum throughput
 - **Large subnet support**: Can scan /16 networks (65k+ hosts) efficiently
@@ -71,6 +74,12 @@ sudo ./zig-out/bin/latency-heatmap 192.168.0.0/16 -d 3000
 # Quick scan with minimal latency probes
 sudo ./zig-out/bin/latency-heatmap 10.0.0.0/24 -p 1
 
+# Watch mode: rescan every 10 seconds and render a live timeline per host
+sudo ./zig-out/bin/latency-heatmap -i 10
+
+# Same, logged to a file (one plain-text snapshot per scan, with UTC timestamps)
+sudo ./zig-out/bin/latency-heatmap -i 30 > latency.log
+
 # Mesh mode: run this on each device; they find each other automatically
 sudo ./zig-out/bin/latency-heatmap --mesh
 
@@ -87,7 +96,7 @@ sudo ./zig-out/bin/latency-heatmap --mesh --tcp-ping 192.168.1.1:443 --tcp-ping 
 | `-t <ms>` | Timeout per ping in latency phase | 1000 |
 | `--mesh` | Mesh mode: discover peers, share results, render the combined matrix | off |
 | `--mesh-port <port>` | UDP+TCP port for mesh discovery, gossip, and node-to-node probes | 47269 |
-| `-i <sec>` | Mesh mode: rescan interval in seconds (0 = scan once) | 60 |
+| `-i <sec>` | Rescan interval in seconds; keeps a rolling history and renders it as a timeline (0 = scan once) | 0 standalone, 60 in mesh mode |
 | `--tcp-ping <ip:port>` | Mesh mode: TCP-ping this host on a known port (repeatable, up to 16) | none |
 | `--no-color` | Disable colored output (also off when stdout is not a terminal or `NO_COLOR` is set) | |
 | `-h, --help` | Show help message | |
@@ -110,11 +119,48 @@ sudo ./zig-out/bin/latency-heatmap --mesh --tcp-ping 192.168.1.1:443 --tcp-ping 
 2. **Phase 2: Latency Measurement**
    - For each discovered host, sends multiple pings
    - On Linux and macOS, reply arrival times come from kernel timestamps (`SCM_TIMESTAMP`), not userspace clocks, so scheduling jitter is excluded from the samples; Windows has no equivalent, so samples there use monotonic userspace timestamps taken at poll wakeup
-   - Records min/avg/max latency for each host
+   - Records min/avg/max latency and probes sent/answered (packet loss) for each host
    - The early-exit silence window scales with the slowest RTT observed so far, so replies from high-latency hosts still in flight aren't clipped by a burst of fast responders finishing first
    - Displays results with color-coded heatmap
 
 The phases are deliberately sequential: latency is measured in a quiet window after the discovery blast, so probes never compete with the scanner's own traffic for the NIC and socket buffers.
+
+## Watch Mode: the time axis
+
+A single scan is a snapshot, and the problems people reach for a latency tool to diagnose are almost never visible in a snapshot: the Wi-Fi that hiccups every few minutes, the NAS that stalls under backup load, the switch port that drops a fraction of everything. `-i <sec>` turns the heatmap into a timeline. The scanner rescans on the interval, keeps the last 120 scans per host, and redraws the view in place:
+
+```
+  192.168.1.0/24 · scan #47 every 10s · 13 hosts up of 14 seen · running 7m50s · 13:11:18Z
+  Next rescan in 6s
+
+  host             -6m40s    -5m       -3m20s    -1m40s   now  now         avg/worst       loss
+  192.168.1.1      ████████████████████████████████████████  █ 640µs     612µs/1.2ms     0%
+  192.168.1.9      ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  ▓ 1.8ms     1.7ms/2.4ms     0%
+  192.168.1.42     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░  ░ 48.2ms    9.1ms/61.0ms    0%
+  192.168.1.77     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  ▓ 2.1ms     2.0ms/2.6ms     0%
+  192.168.1.120    ▓▓▓▓▒▓▓▓▓▓▒▒▓▓▓▓▓▓▒▓▓▓▓▓▒▓▓▓▓▓▓▒▓▓▓▓▓▓▒▓  ▒ 2.3ms     2.2ms/3.0ms    11%
+  192.168.1.200    ████████████████████████████·····×······  · gone      710µs/900µs     0%
+
+  Legend: █ <1ms  ▓ <5ms  ▒ <20ms  ░ <100ms  ▪ >100ms  × no reply  · not found  (loss >20% ▒, >50% ░)
+  each cell is one scan, oldest left, showing the worse of latency and loss · avg/worst and loss cover the whole window
+
+  ⚠ Changes:
+    192.168.1.200 stopped answering 1m50s ago (was 710µs)
+    192.168.1.120 dropping probes since 40s ago: 20% loss, 2.3ms when it answers (usually 2.2ms)
+    192.168.1.42 degraded 2m20s ago: 48.2ms now vs 9.1ms usually
+```
+
+Each row is one host; each cell is one scan, oldest on the left. The ruler above the strip is built from the actual scan timestamps, so it stays honest when a scan takes longer than the interval. The strip is as wide as the terminal allows (up to 120 scans); `avg/worst` and `loss` summarize the whole window, while `now` is the newest scan.
+
+Three things become visible that a snapshot hides:
+
+- **When it started.** `.42` was fine for the first two thirds of the window and has been slow since — something changed at that moment (a backup job, a new client on the AP). A host that has always been slow is not flagged, because it is compared against its own baseline, not an absolute threshold.
+- **Intermittent loss.** `.120` looks fine in any single scan (2ms) but the strip shows a `▒` every few scans: it drops a probe now and then. Cells show the worse of latency and loss — a host answering 2 of 5 probes at 1ms is painted by the loss, not the latency — so this pattern cannot hide behind fast replies.
+- **Disappearance.** `.200` stopped being discovered (`·`), briefly answered discovery but no probes (`×`), and is gone. The `Changes` section says since when and what it used to measure.
+
+Change detection compares each host's newest scans against the median of its earlier ones, and only reports a run of at least two bad scans (one blip is noise) with at least four normal scans before it (so the baseline is real). "Bad" means gone, dropping ≥20% of probes, or ≥3x slower than baseline and more than 2ms apart.
+
+When stdout is not a terminal, every scan appends one plain-text snapshot (with a UTC clock in the header) instead of redrawing, so `-i 30 > latency.log` gives a log you can grep later.
 
 ## Mesh Mode
 
@@ -142,15 +188,17 @@ A single scanner sees the network from exactly one vantage point. `--mesh` remov
     Observer pi4 sees a median of 8.2ms vs 900µs mesh-wide — its own link is likely the bottleneck
 ```
 
+On a wide enough terminal the matrix also carries a `self, per scan` timeline strip per row (this node's own scans over time, as in watch mode), and every node keeps a history for each peer's gossiped results too, so the `Changes` section reports hosts that recently degraded, went lossy, or vanished — as seen from each vantage point. A host that degraded from every observer at the same moment is itself the problem; one that degraded from only one observer points at that observer's path. Cells in the matrix show the worse of latency and loss, with `✗N%` after the latency when probes were dropped.
+
 Comparing the same host from multiple vantage points localizes problems a single scanner can't:
 
 - A host slow from **every** observer is itself the problem (slow radio, power-saving NIC, overload)
 - A host slow from **some** observers (`◀ uneven`) points at a link, switch, or AP between network segments
 - An observer that measures **everything** slow has a bad uplink of its own — the insight section calls this out
 
-How it works: each node broadcasts a small UDP beacon every 2 seconds to announce itself, and gossips its scan results (chunked to fit under the MTU) every 5 seconds plus immediately to newly joined peers. There is no coordinator — every node converges on the full matrix and renders it live. By default each node rescans every 60 seconds (`-i` changes this; `-i 0` scans once and keeps sharing). Mesh traffic is deliberately phase-separated from measurement: while a scan runs, only the tiny beacons keep flowing (so a long scan doesn't get the node dropped from its peers' tables, and incoming datagrams keep being drained), while result gossip is deferred until the scan completes — the mesh never competes with its own probes.
+How it works: each node broadcasts a small UDP beacon every 2 seconds to announce itself, and gossips its scan results (chunked to fit under the MTU; each entry carries min/avg/max and the probe counts sent and answered) every 5 seconds plus immediately to newly joined peers. There is no coordinator — every node converges on the full matrix and renders it live. By default each node rescans every 60 seconds (`-i` changes this; `-i 0` scans once and keeps sharing). Mesh traffic is deliberately phase-separated from measurement: while a scan runs, only the tiny beacons keep flowing (so a long scan doesn't get the node dropped from its peers' tables, and incoming datagrams keep being drained), while result gossip is deferred until the scan completes — the mesh never competes with its own probes.
 
-Incoming datagrams are treated as untrusted input: fixed caps on peers and hosts, strict length validation, and anything malformed or from a different protocol version is dropped silently.
+Incoming datagrams are treated as untrusted input: fixed caps on peers and hosts, strict length validation, and anything malformed or from a different protocol version is dropped silently. (The protocol magic is `NLH2`; nodes still running the `NLH1` build — whose entries lack the probe counts — ignore each other and this version, so mixing them is harmless but they will not see each other.)
 
 ### Node-to-node TCP and UDP pings
 
@@ -179,14 +227,17 @@ Target results are gossiped too: the `tcp target` matrix shows the union of ever
 
 ## Heatmap Legend
 
-| Symbol | Latency | Color |
-|--------|---------|-------|
-| `█` | < 1ms | Bright Green |
-| `▓` | < 5ms | Green |
-| `▒` | < 20ms | Yellow |
-| `░` | < 100ms | Orange |
-| `▪` | > 100ms | Red |
-| `·` | offline | Gray |
+| Symbol | Latency | or packet loss | Color |
+|--------|---------|----------------|-------|
+| `█` | < 1ms | 0% | Bright Green |
+| `▓` | < 5ms | | Green |
+| `▒` | < 20ms | ≤ 20% | Yellow |
+| `░` | < 100ms | ≤ 50% | Orange |
+| `▪` | > 100ms | > 50% | Red |
+| `×` | discovered, but no probe answered | 100% | Red |
+| `·` | not discovered / offline | | Gray |
+
+A cell shows the worse of its two columns: a host at 800µs that dropped 2 of 5 probes is `░`, not `█`. In the single-scan grid, loss is also printed after the min/avg/max as `✗N%`.
 
 ## Output Example
 
@@ -208,14 +259,15 @@ Legend: █ <1ms  ▓ <5ms  ▒ <20ms  ░ <100ms  ▪ >100ms  · offline
 
 Active Devices:
 192.168.1.1     192.168.1.10    192.168.1.15    192.168.1.20
-█ 0.8ms         ▓ 2.1ms         ▒ 15.3ms        ░ 85.2ms
+█ 0.8ms         ▓ 2.1ms         ▒ 15.3ms        ░ 85.2ms ✗20%
 ```
 
 ## Use Cases
 
 - **Network troubleshooting**: Find hosts that are slow to respond
 - **Network inventory**: Quick discovery of all active devices on a subnet
-- **Performance monitoring**: Track latency to critical infrastructure
+- **Performance monitoring**: Track latency to critical infrastructure over time with `-i`, and see exactly when something changed
+- **Intermittent problems**: Catch the Wi-Fi that drops out every few minutes or the host that loses a probe every few scans — patterns no single scan can show
 
 ## License
 
