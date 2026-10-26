@@ -274,9 +274,11 @@ pub fn encodeFrame(out: *std.Io.Writer, body: []const u8, size: ?plat.TermSize) 
     try out.writeAll("\x1b[?2026h\x1b[?25l\x1b[H");
 
     const max_cols: usize = if (size) |sz| @max(@as(usize, sz.cols), 2) - 1 else std.math.maxInt(usize);
-    const max_lines: usize = if (size) |sz| @max(@as(usize, sz.rows), 2) - 1 else std.math.maxInt(usize);
+    // Newline-terminated lines that fit without scrolling (0 on a 1-row
+    // terminal, where only an unterminated note line can be shown)
+    const max_lines: usize = if (size) |sz| @as(usize, sz.rows) -| 1 else std.math.maxInt(usize);
     const total_lines = std.mem.count(u8, body, "\n") + @intFromBool(body.len > 0 and body[body.len - 1] != '\n');
-    const keep_lines = if (total_lines > max_lines) max_lines - 1 else total_lines;
+    const keep_lines = if (total_lines > max_lines) max_lines -| 1 else total_lines;
 
     var rest = body;
     var line_no: usize = 0;
@@ -294,7 +296,7 @@ pub fn encodeFrame(out: *std.Io.Writer, body: []const u8, size: ?plat.TermSize) 
             sgr("\x1b[90m"), total_lines - keep_lines, sgr("\x1b[0m"),
         }) catch "";
         try writeClipped(out, note, max_cols);
-        try out.writeAll("\x1b[K\n");
+        try out.writeAll(if (max_lines > 0) "\x1b[K\n" else "\x1b[K");
     }
     try out.writeAll("\x1b[0J\x1b[?25h\x1b[?2026l");
 }
@@ -430,6 +432,22 @@ test "encodeFrame cuts a frame taller than the terminal, leaving a note" {
     try testing.expect(std.mem.startsWith(u8, got, "\x1b[?2026h\x1b[?25l\x1b[H1\x1b[K\n2\x1b[K\n  ... 3 more lines"));
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, got, "\n"));
     try testing.expect(std.mem.endsWith(u8, got, "\x1b[K\n\x1b[0J\x1b[?25h\x1b[?2026l"));
+}
+
+test "encodeFrame never ends a 1-row frame with a newline" {
+    const saved = color_enabled;
+    defer color_enabled = saved;
+    color_enabled = false;
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try encodeFrame(&w, "1\n2\n", .{ .rows = 1, .cols = 80 });
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, w.buffered(), "\n"));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "2 more lines") != null);
+
+    w = std.Io.Writer.fixed(&buf);
+    try encodeFrame(&w, "1\n2\n", .{ .rows = 2, .cols = 80 });
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "\n"));
 }
 
 test "PingResult.lossPct" {

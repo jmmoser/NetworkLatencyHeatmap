@@ -28,7 +28,7 @@ A fast network scanner that discovers hosts on your network and measures their l
 ## Requirements
 
 - macOS/BSD (kqueue), Linux (epoll), or Windows 10+ (Winsock2) — uses raw ICMP sockets
-- Elevated privileges for raw socket access: root/sudo on macOS and Linux, an Administrator prompt on Windows. Under sudo, root is dropped as soon as the sockets are open. On Linux there are two ways to avoid sudo altogether:
+- Elevated privileges for raw socket access: root/sudo on macOS and Linux, an Administrator prompt on Windows. Under sudo, root is dropped as soon as the sockets are open. (Root without the capability to switch users, such as a container started with `--cap-drop=ALL --cap-add=NET_RAW`, keeps running as that already-confined root and says so.) On Linux there are two ways to avoid sudo altogether:
   - grant the binary raw-socket access: `sudo setcap cap_net_raw+ep ./zig-out/bin/latency-heatmap`
   - or allow unprivileged ICMP "ping sockets" for your group (already the default on many distros, including Ubuntu and Fedora): `sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"` — the scanner falls back to one automatically when it can't open a raw socket
 - Zig 0.16+
@@ -126,7 +126,7 @@ sudo ./zig-out/bin/latency-heatmap 192.168.1.0/24 --csv 2>/dev/null
 1. **Phase 1: Discovery**
    - Blasts ICMP echo requests to all IPs in the subnet
    - Re-pings the addresses that stayed silent (`--retries`, 1 extra pass by default); late replies to an earlier pass still count
-   - Waits for the discovery timeout to collect responses (giving up after 500ms if nothing at all answered, unless `-d` is shorter)
+   - Waits for the discovery timeout to collect responses (under the default timeout it gives up 500ms after sending if nothing at all answered; an explicit `-d` is always waited out in full, for slow links)
    - Records which hosts are alive
    - Checks the neighbor (ARP) table for hosts that answered ARP but not ping (see below)
 
@@ -143,7 +143,7 @@ On a directly attached (on-link) subnet, the kernel has to ARP for every address
 
 ### Hosts that don't answer ping
 
-Plenty of devices drop ICMP echo (Windows' default firewall does). A device on the local segment still has to answer ARP to receive anything, and the discovery sweep makes the kernel ARP for every address. So after the sweep the scanner reads the neighbor table and reports the addresses it resolved that never answered ping, as `no ICMP (ARP only)`. Entries left over from before the scan may be stale, so only entries this scan demonstrably resolved count: on Linux, those the kernel marks `REACHABLE` (netlink `RTM_GETNEIGH`); on macOS and Windows, which don't expose reachability, those that weren't in the table before the sweep. This only sees hosts on the same layer-2 segment; `--no-arp` turns it off.
+Plenty of devices drop ICMP echo (Windows' default firewall does). A device on the local segment still has to answer ARP to receive anything, and the discovery sweep makes the kernel ARP for every address. So after the sweep the scanner reads the neighbor table and reports the addresses it resolved that never answered ping, as `no ICMP (ARP only)`. Entries left over from before the scan may be stale, so only entries this scan demonstrably resolved count: on Linux, those the kernel marks `REACHABLE` (netlink `RTM_GETNEIGH`); on macOS and Windows, which don't expose reachability, those that weren't in the table before the sweep. In mesh mode a host found that way stays listed on later rescans while its entry remains in the table, so once it leaves it can linger until the OS expires the entry (up to 20 minutes on macOS). This only sees hosts on the same layer-2 segment; `--no-arp` turns it off.
 
 ### Machine-readable output
 
@@ -189,7 +189,7 @@ Incoming datagrams are treated as untrusted input. Anything whose source isn't o
 
 #### Authenticated mesh
 
-Anyone on the LAN can join an open mesh or forge its messages. With `--mesh-key <secret>` (or `--mesh-key-file <path>`, which keeps the secret out of the process list), every message carries an HMAC-SHA256 tag (truncated to 16 bytes) under a distinct protocol magic, and nodes drop anything not tagged with the same secret. Keyed and open meshes on the same port ignore each other. The tag proves a message came from a key holder, but doesn't prevent a captured message from being replayed. Replays can only refresh a peer or re-deliver results it already sent, and pongs older than 10s are rejected.
+Anyone on the LAN can join an open mesh or forge its messages. With `--mesh-key <secret>` (or `--mesh-key-file <path>`, which keeps the secret out of the process list), every message carries an HMAC-SHA256 tag (truncated to 16 bytes) under a distinct protocol magic, and nodes drop anything not tagged with the same secret. Keyed and open meshes on the same port ignore each other. A tag alone proves a message was made by a key holder, not that it is fresh or came from where it claims, so a captured message could be replayed later from a forged source. To close that off, a keyed node trusts an address only after a challenge. A message from an unknown node, or from a known node at a new address, makes it ping that address with a fresh token. The node is accepted only once a pong echoing that exact token comes back from that address, which needs both the key and the address. A keyed peer also stays alive only by answering its latest ping, and results only move forward in sequence. So replays can't bring back a departed node, redirect a live one, trigger a results burst, or roll data back. What remains possible is re-delivering a peer's current data from its own address, or causing at most one challenge ping per second per (node, address), with no amplification. One consequence: two keyed nodes on the *same* machine (sharing the port via `SO_REUSEPORT`) generally can't pair, because the kernel may deliver a challenge ping back to its sender. Run keyed nodes on separate hosts.
 
 ### Node-to-node TCP and UDP pings
 

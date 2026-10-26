@@ -25,6 +25,9 @@ pub const Neighbor = struct {
 
 pub const supported = builtin.os.tag == .linux or builtin.os.tag.isDarwin() or plat.is_windows;
 
+// Whether Neighbor.reachable is meaningful (only Linux exposes the state)
+pub const reports_reachability = builtin.os.tag == .linux;
+
 // Append every resolved IPv4 neighbor entry to out. Best-effort: any
 // failure just yields fewer (or no) entries.
 pub fn collect(allocator: std.mem.Allocator, out: *std.ArrayList(Neighbor)) void {
@@ -66,6 +69,8 @@ const NLM_F_DUMP: u16 = 0x300;
 const NDA_DST: u16 = 1;
 const NDA_LLADDR: u16 = 2;
 const nlmsg_hdr_len = 16;
+// Netlink headers and attributes are in host byte order
+const nl_endian = builtin.cpu.arch.endian();
 const ndmsg_len = 12;
 
 // ndm_state bits
@@ -86,10 +91,10 @@ fn collectLinux(allocator: std.mem.Allocator, out: *std.ArrayList(Neighbor)) voi
     _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &tv, @sizeOf(posix.timeval));
 
     var req: [nlmsg_hdr_len + ndmsg_len]u8 = @splat(0);
-    std.mem.writeInt(u32, req[0..4], req.len, .little);
-    std.mem.writeInt(u16, req[4..6], RTM_GETNEIGH, .little);
-    std.mem.writeInt(u16, req[6..8], NLM_F_REQUEST | NLM_F_DUMP, .little);
-    std.mem.writeInt(u32, req[8..12], 1, .little); // seq
+    std.mem.writeInt(u32, req[0..4], req.len, nl_endian);
+    std.mem.writeInt(u16, req[4..6], RTM_GETNEIGH, nl_endian);
+    std.mem.writeInt(u16, req[6..8], NLM_F_REQUEST | NLM_F_DUMP, nl_endian);
+    std.mem.writeInt(u32, req[8..12], 1, nl_endian); // seq
     req[nlmsg_hdr_len] = posix.AF.INET; // ndm_family
     if (c.send(fd, &req, req.len, 0) != req.len) return;
 
@@ -106,15 +111,17 @@ fn collectLinux(allocator: std.mem.Allocator, out: *std.ArrayList(Neighbor)) voi
 pub fn parseNetlink(buf: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(Neighbor)) bool {
     var off: usize = 0;
     while (off + nlmsg_hdr_len <= buf.len) {
-        const len = std.mem.readInt(u32, buf[off..][0..4], .little);
-        const msg_type = std.mem.readInt(u16, buf[off + 4 ..][0..2], .little);
-        if (len < nlmsg_hdr_len or off + len > buf.len) return true;
+        const len = std.mem.readInt(u32, buf[off..][0..4], nl_endian);
+        const msg_type = std.mem.readInt(u16, buf[off + 4 ..][0..2], nl_endian);
+        // len > buf.len - off, not off + len > buf.len: a bogus length
+        // must not overflow a 32-bit usize
+        if (len < nlmsg_hdr_len or len > buf.len - off) return true;
         if (msg_type == NLMSG_DONE or msg_type == NLMSG_ERROR) return true;
 
         if (msg_type == RTM_NEWNEIGH and len >= nlmsg_hdr_len + ndmsg_len) {
             const nd = buf[off + nlmsg_hdr_len ..][0..ndmsg_len];
             const family = nd[0];
-            const state = std.mem.readInt(u16, nd[8..10], .little);
+            const state = std.mem.readInt(u16, nd[8..10], nl_endian);
             const resolved = state & (NUD_INCOMPLETE | NUD_FAILED | NUD_NOARP) == 0 and state != 0;
             if (family == posix.AF.INET and resolved) {
                 var dst: ?u32 = null;
@@ -122,9 +129,9 @@ pub fn parseNetlink(buf: []const u8, allocator: std.mem.Allocator, out: *std.Arr
                 var aoff: usize = off + nlmsg_hdr_len + ndmsg_len;
                 const end = off + len;
                 while (aoff + 4 <= end) {
-                    const alen = std.mem.readInt(u16, buf[aoff..][0..2], .little);
-                    const atype = std.mem.readInt(u16, buf[aoff + 2 ..][0..2], .little) & 0x3FFF;
-                    if (alen < 4 or aoff + alen > end) break;
+                    const alen = std.mem.readInt(u16, buf[aoff..][0..2], nl_endian);
+                    const atype = std.mem.readInt(u16, buf[aoff + 2 ..][0..2], nl_endian) & 0x3FFF;
+                    if (alen < 4 or alen > end - aoff) break;
                     const payload = buf[aoff + 4 .. aoff + alen];
                     if (atype == NDA_DST and payload.len == 4) dst = std.mem.bytesToValue(u32, payload[0..4]);
                     if (atype == NDA_LLADDR and payload.len > 0) has_lladdr = true;
@@ -224,24 +231,24 @@ test "parseNetlink keeps resolved IPv4 neighbors and their reachability" {
     };
     for (ents) |e| {
         const len: usize = nlmsg_hdr_len + ndmsg_len + 8 + (if (e.lladdr) @as(usize, 12) else 0);
-        std.mem.writeInt(u32, buf[off..][0..4], @intCast(len), .little);
-        std.mem.writeInt(u16, buf[off + 4 ..][0..2], RTM_NEWNEIGH, .little);
+        std.mem.writeInt(u32, buf[off..][0..4], @intCast(len), nl_endian);
+        std.mem.writeInt(u16, buf[off + 4 ..][0..2], RTM_NEWNEIGH, nl_endian);
         buf[off + nlmsg_hdr_len] = posix.AF.INET;
-        std.mem.writeInt(u16, buf[off + nlmsg_hdr_len + 8 ..][0..2], e.state, .little);
+        std.mem.writeInt(u16, buf[off + nlmsg_hdr_len + 8 ..][0..2], e.state, nl_endian);
         var a = off + nlmsg_hdr_len + ndmsg_len;
-        std.mem.writeInt(u16, buf[a..][0..2], 8, .little);
-        std.mem.writeInt(u16, buf[a + 2 ..][0..2], NDA_DST, .little);
+        std.mem.writeInt(u16, buf[a..][0..2], 8, nl_endian);
+        std.mem.writeInt(u16, buf[a + 2 ..][0..2], NDA_DST, nl_endian);
         @memcpy(buf[a + 4 ..][0..4], &e.ip);
         a += 8;
         if (e.lladdr) {
-            std.mem.writeInt(u16, buf[a..][0..2], 10, .little);
-            std.mem.writeInt(u16, buf[a + 2 ..][0..2], NDA_LLADDR, .little);
+            std.mem.writeInt(u16, buf[a..][0..2], 10, nl_endian);
+            std.mem.writeInt(u16, buf[a + 2 ..][0..2], NDA_LLADDR, nl_endian);
             @memcpy(buf[a + 4 ..][0..6], &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff });
         }
         off += len;
     }
-    std.mem.writeInt(u32, buf[off..][0..4], nlmsg_hdr_len, .little);
-    std.mem.writeInt(u16, buf[off + 4 ..][0..2], NLMSG_DONE, .little);
+    std.mem.writeInt(u32, buf[off..][0..4], nlmsg_hdr_len, nl_endian);
+    std.mem.writeInt(u16, buf[off + 4 ..][0..2], NLMSG_DONE, nl_endian);
     off += nlmsg_hdr_len;
 
     var out: std.ArrayList(Neighbor) = .empty;
@@ -300,4 +307,15 @@ test "collect runs without crashing on the host platform" {
     var out: std.ArrayList(Neighbor) = .empty;
     defer out.deinit(testing.allocator);
     collect(testing.allocator, &out);
+}
+
+test "parseNetlink stops on an oversized length instead of overflowing" {
+    var buf: [2 * nlmsg_hdr_len]u8 align(4) = @splat(0);
+    std.mem.writeInt(u32, buf[0..4], nlmsg_hdr_len, nl_endian);
+    std.mem.writeInt(u16, buf[4..6], RTM_NEWNEIGH, nl_endian);
+    std.mem.writeInt(u32, buf[nlmsg_hdr_len..][0..4], 0xFFFF_FFF8, nl_endian);
+    var out: std.ArrayList(Neighbor) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expect(parseNetlink(&buf, testing.allocator, &out));
+    try testing.expectEqual(@as(usize, 0), out.items.len);
 }

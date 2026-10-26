@@ -303,6 +303,9 @@ const Config = struct {
     subnet: [4]u8 = .{ 192, 168, 1, 0 },
     mask_bits: u8 = 24,
     discovery_timeout_ms: u32 = 1000, // Time to wait for discovery responses
+    // Whether -d was given: an explicit timeout is always waited out in
+    // full, even when nothing has answered yet (slow links)
+    discovery_timeout_set: bool = false,
     latency_pings: u8 = 5, // Number of pings per host for latency measurement
     latency_timeout_ms: u32 = 1000, // Timeout per ping in latency phase
     mesh: bool = false, // Share results with peers and render the mesh matrix
@@ -474,7 +477,8 @@ fn senderThread(state: *ScanState) void {
         // Pace against the schedule (not per-packet sleeps), so coarse
         // sleep granularity costs burstiness, never the average rate
         if (state.rate_pps > 0) {
-            const due_us = start_us + @as(i64, @intCast(i * std.time.us_per_s / state.rate_pps));
+            // u64 math: i * 1e6 overflows a 32-bit usize past ~4300 targets
+            const due_us = start_us + @as(i64, @intCast(@as(u64, i) * std.time.us_per_s / state.rate_pps));
             const now_us = monotonicMicros();
             if (due_us > now_us) sleepNanos(@intCast((due_us - now_us) * std.time.ns_per_us));
         }
@@ -539,6 +543,10 @@ const Scanner = struct {
     magic: [4]u8,
     kernel_ts_enabled: bool,
     generation: u8 = 0,
+
+    // Hosts the previous scan reported as answering ARP but not ping
+    // (host byte order). See silentNeighbors.
+    known_silent: std.AutoHashMap(u32, void),
 
     // Optional callback invoked periodically from inside the scan loops, so
     // mesh mode can keep beaconing and draining its UDP socket during a
@@ -665,6 +673,7 @@ const Scanner = struct {
             .is_raw_socket = is_raw,
             .magic = magic,
             .kernel_ts_enabled = ts_enabled,
+            .known_silent = std.AutoHashMap(u32, void).init(allocator),
         };
     }
 
@@ -708,6 +717,7 @@ const Scanner = struct {
     }
 
     pub fn deinit(self: *Scanner) void {
+        self.known_silent.deinit();
         self.poller.deinit();
         plat.closeSocket(self.sock);
     }
@@ -758,7 +768,11 @@ const Scanner = struct {
             // full discovery timeout
             const final = pass + 1 == passes;
             const wait_ms: u32 = if (final) self.config.discovery_timeout_ms else @min(self.config.discovery_timeout_ms, 250);
-            try self.discoveryPass(&discovered, targets, magic, rate, wait_ms, final, stdout);
+            // Give up early on an empty subnet only under the default
+            // timeout; an explicit -d (e.g. 3000 for a slow link) is
+            // always waited out in full
+            const early_exit = final and !self.config.discovery_timeout_set;
+            try self.discoveryPass(&discovered, targets, magic, rate, wait_ms, early_exit, stdout);
         }
 
         stdout.print("{s}  Discovered: {d} hosts                                      \n", .{ common.cr(), discovered.count() }) catch {};
@@ -817,8 +831,8 @@ const Scanner = struct {
         // Track when sender finishes for timeout calculation
         var sender_finish_time: ?i64 = null;
 
-        // Give up early when nothing answered — but never sooner than the
-        // configured timeout itself (-d 3000 on a slow link must wait 3s)
+        // When early exit is allowed, give up 500ms after the last send if
+        // nothing at all has answered
         const early_exit_ms: i64 = @min(500, wait_ms);
 
         // Receive loop - runs until sender is done + timeout
@@ -1262,7 +1276,7 @@ fn printHeatmapGrid(stdout: StdoutWriter, results: []const PingResult, width: us
     }
 }
 
-fn printSummary(stdout: StdoutWriter, results: []const PingResult, scanned: usize) void {
+fn printSummary(allocator: std.mem.Allocator, stdout: StdoutWriter, results: []const PingResult, scanned: usize) void {
     var alive_count: usize = 0;
     var silent_count: usize = 0;
     var unanswered_count: usize = 0; // answered discovery, then no latency replies
@@ -1277,8 +1291,8 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult, scanned: usiz
     var slow_count: usize = 0;
     var lossy_devices: [list_cap]PingResult = undefined;
     var lossy_count: usize = 0;
-    var stddevs: [256]u64 = undefined;
-    var stddev_count: usize = 0;
+    var stddevs: std.ArrayList(u64) = .empty;
+    defer stddevs.deinit(allocator);
 
     for (results) |r| {
         if (!r.icmp) {
@@ -1291,12 +1305,7 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult, scanned: usiz
             if (lossy_count < list_cap) lossy_devices[lossy_count] = r;
             lossy_count += 1;
         }
-        if (r.stddev_us) |sd| {
-            if (stddev_count < stddevs.len) {
-                stddevs[stddev_count] = sd;
-                stddev_count += 1;
-            }
-        }
+        if (r.stddev_us) |sd| stddevs.append(allocator, sd) catch {};
         if (r.latency_avg) |avg_lat| {
             alive_count += 1;
             total_avg_latency += avg_lat;
@@ -1351,10 +1360,10 @@ fn printSummary(stdout: StdoutWriter, results: []const PingResult, scanned: usiz
         stdout.print("    Best:  {s}\n", .{formatLatency(best_avg, &buf1)}) catch {};
         stdout.print("    Mean:  {s}\n", .{formatLatency(total_avg_latency / alive_count, &buf2)}) catch {};
         stdout.print("    Worst: {s}\n", .{formatLatency(worst_avg, &buf3)}) catch {};
-        if (stddev_count > 0) {
+        if (stddevs.items.len > 0) {
             var buf4: [16]u8 = undefined;
-            std.mem.sort(u64, stddevs[0..stddev_count], {}, std.sort.asc(u64));
-            stdout.print("    Jitter (median stddev): {s}\n", .{formatLatency(stddevs[stddev_count / 2], &buf4)}) catch {};
+            std.mem.sort(u64, stddevs.items, {}, std.sort.asc(u64));
+            stdout.print("    Jitter (median stddev): {s}\n", .{formatLatency(stddevs.items[stddevs.items.len / 2], &buf4)}) catch {};
         }
     }
 
@@ -1515,18 +1524,34 @@ fn isHostOf(ip: u32, subnet: [4]u8, mask_bits: u8) bool {
 
 // Neighbor-table addresses this scan resolved that never answered ping:
 // present on the segment, silent to ICMP. Returns host-order [4]u8 IPs.
+//
+// Where the OS reports no reachability state (macOS, Windows), "resolved by
+// this scan" means "not in the table before it" — but a silent host found
+// by one mesh rescan is still cached when the next one starts, and would
+// drop out of every later scan. So hosts reported last time (`carried`)
+// stay reported while their entry remains in the table; when one leaves,
+// it disappears once the OS expires the entry.
 fn silentNeighbors(
     allocator: std.mem.Allocator,
     config: Config,
     before: []const neigh.Neighbor,
     alive: []const [4]u8,
+    carried: *const std.AutoHashMap(u32, void),
 ) ![][4]u8 {
     var after: std.ArrayList(neigh.Neighbor) = .empty;
     defer after.deinit(allocator);
     neigh.collect(allocator, &after);
 
-    const fresh = try neigh.fresh(allocator, before, after.items);
-    defer allocator.free(fresh);
+    const fresh_only = try neigh.fresh(allocator, before, after.items);
+    defer allocator.free(fresh_only);
+    var fresh: std.ArrayList(u32) = .empty;
+    defer fresh.deinit(allocator);
+    try fresh.appendSlice(allocator, fresh_only);
+    if (!neigh.reports_reachability) {
+        for (after.items) |n| {
+            if (carried.contains(ipToU32(@bitCast(n.ip)))) try fresh.append(allocator, n.ip);
+        }
+    }
 
     var alive_set = std.AutoHashMap(u32, void).init(allocator);
     defer alive_set.deinit();
@@ -1534,7 +1559,7 @@ fn silentNeighbors(
 
     var silent: std.ArrayList([4]u8) = .empty;
     errdefer silent.deinit(allocator);
-    for (fresh) |addr_be| {
+    for (fresh.items) |addr_be| {
         const ip: [4]u8 = @bitCast(addr_be);
         const key = ipToU32(ip);
         if (!isHostOf(key, config.subnet, config.mask_bits)) continue;
@@ -1560,10 +1585,12 @@ fn runScanOnce(scanner: *Scanner, allocator: std.mem.Allocator, stdout: StdoutWr
     defer alive_hosts.deinit(allocator);
 
     const silent: [][4]u8 = if (use_arp)
-        try silentNeighbors(allocator, scanner.config, before.items, alive_hosts.items)
+        try silentNeighbors(allocator, scanner.config, before.items, alive_hosts.items, &scanner.known_silent)
     else
         &.{};
     defer if (use_arp) allocator.free(silent);
+    scanner.known_silent.clearRetainingCapacity();
+    for (silent) |ip| try scanner.known_silent.put(ipToU32(ip), {});
     if (silent.len > 0) {
         stdout.print("  Neighbor table: {d} more host{s} ARP but not ping\n", .{
             silent.len,
@@ -1688,6 +1715,7 @@ fn dropPrivilegesOrExit(log: StdoutWriter) void {
             if (d.sudo_user) ", the sudo user" else ", nobody",
         }) catch {},
         .failed => fail("could not drop root privileges after opening sockets", .{}),
+        .not_permitted => log.print("  Privileges: still root (no capability to switch user; confined container?)\n", .{}) catch {},
         .not_root, .unsupported => {},
     }
 }
@@ -1786,6 +1814,7 @@ pub fn main(init: std.process.Init) !void {
             const value = nextArgValue(args, &i);
             config.discovery_timeout_ms = std.fmt.parseInt(u32, value, 10) catch
                 return invalidArgValue("-d", value);
+            config.discovery_timeout_set = true;
         } else if (std.mem.eql(u8, arg, "-p")) {
             const value = nextArgValue(args, &i);
             const pings = std.fmt.parseInt(u8, value, 10) catch
@@ -2007,7 +2036,7 @@ pub fn main(init: std.process.Init) !void {
     stdout.print("\n{s}Active Devices:{s}\n", .{ bold, reset }) catch {};
     printHeatmapGrid(stdout, results, 4);
 
-    printSummary(stdout, results, all_ips.len);
+    printSummary(allocator, stdout, results, all_ips.len);
 }
 
 const testing = std.testing;

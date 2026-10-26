@@ -488,6 +488,10 @@ pub fn terminalSize() ?TermSize {
 pub const DropResult = union(enum) {
     not_root, // nothing to drop (unprivileged, or setcap'd binary)
     unsupported, // Windows
+    // Root without the capabilities to change identity (e.g. a container
+    // run with --cap-drop=ALL --cap-add=NET_RAW): nothing was changed, and
+    // such a root is already confined, so the caller carries on
+    not_permitted,
     dropped: struct { uid: u32, gid: u32, sudo_user: bool },
     failed, // a set*id call failed — the caller should refuse to continue
 };
@@ -526,7 +530,12 @@ pub fn dropPrivileges() DropResult {
         // Order matters: supplementary groups and gid can only be changed
         // while still root
         const g: c.gid_t = @intCast(gid);
-        if (setgroups(1, @ptrCast(&g)) != 0) return .failed;
+        if (setgroups(1, @ptrCast(&g)) != 0) {
+            // EPERM on the first call: no CAP_SETGID, and nothing has
+            // changed yet. Any later failure leaves a half-dropped
+            // identity, which is reported as .failed.
+            return if (std.c._errno().* == @intFromEnum(posix.E.PERM)) .not_permitted else .failed;
+        }
         if (c.setgid(@intCast(gid)) != 0) return .failed;
         if (c.setuid(@intCast(uid)) != 0) return .failed;
         // Verify the drop is irreversible
