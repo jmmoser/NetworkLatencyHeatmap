@@ -96,6 +96,31 @@ pub const win = struct {
     pub const MIB_IPADDR_DELETED: u16 = 0x0040;
 
     pub extern "iphlpapi" fn GetIpAddrTable(pIpAddrTable: ?*anyopaque, pdwSize: *u32, bOrder: c_int) callconv(.winapi) u32;
+
+    // MIB_IPNETROW from GetIpNetTable: one ARP cache entry
+    pub const MIB_IPNETROW = extern struct {
+        index: u32,
+        phys_addr_len: u32,
+        phys_addr: [8]u8,
+        addr: u32, // network byte order
+        type: u32,
+    };
+    pub const MIB_IPNET_TYPE_DYNAMIC: u32 = 3;
+    pub const MIB_IPNET_TYPE_STATIC: u32 = 4;
+    pub const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+    pub extern "iphlpapi" fn GetIpNetTable(pIpNetTable: ?*anyopaque, pdwSize: *u32, bOrder: c_int) callconv(.winapi) u32;
+
+    pub const COORD = extern struct { x: i16, y: i16 };
+    pub const SMALL_RECT = extern struct { left: i16, top: i16, right: i16, bottom: i16 };
+    pub const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
+        size: COORD,
+        cursor_position: COORD,
+        attributes: u16,
+        window: SMALL_RECT,
+        maximum_window_size: COORD,
+    };
+    pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOutput: ?*anyopaque, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) c_int;
 };
 
 pub const Socket = if (is_windows) win.SOCKET else posix.fd_t;
@@ -426,6 +451,118 @@ pub fn windowsSetupConsole() bool {
     _ = win.SetConsoleMode(handle, mode | win.ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     _ = win.SetConsoleOutputCP(win.CP_UTF8);
     return true;
+}
+
+// Visible terminal size of stdout, or null when stdout isn't a terminal
+// (or the platform won't say). Live views clip their frames to it, since
+// a frame taller or wider than the window scrolls or wraps and can no
+// longer be overwritten in place.
+pub const TermSize = struct { rows: u16, cols: u16 };
+
+extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+
+pub fn terminalSize() ?TermSize {
+    if (is_windows) {
+        const handle = win.GetStdHandle(win.STD_OUTPUT_HANDLE) orelse return null;
+        var info: win.CONSOLE_SCREEN_BUFFER_INFO = undefined;
+        if (win.GetConsoleScreenBufferInfo(handle, &info) == 0) return null;
+        const rows = @as(i32, info.window.bottom) - info.window.top + 1;
+        const cols = @as(i32, info.window.right) - info.window.left + 1;
+        if (rows <= 0 or cols <= 0) return null;
+        return .{ .rows = @intCast(rows), .cols = @intCast(cols) };
+    } else {
+        var ws: posix.winsize = undefined;
+        if (ioctl(posix.STDOUT_FILENO, @intCast(c.T.IOCGWINSZ), &ws) != 0) return null;
+        if (ws.row == 0 or ws.col == 0) return null;
+        return .{ .rows = ws.row, .cols = ws.col };
+    }
+}
+
+// Privilege drop. Root (or Administrator) is needed only to open the raw
+// ICMP socket; once it is open, keeping root just widens the blast radius
+// of every later bug — and mesh mode parses datagrams from the network.
+// On POSIX, when running as root, switch to the invoking user (sudo's
+// SUDO_UID/SUDO_GID), or to "nobody" when there is no invoking user.
+// Already-open sockets keep working. Windows has no equivalent of
+// setuid for a running process, so it is a no-op there.
+pub const DropResult = union(enum) {
+    not_root, // nothing to drop (unprivileged, or setcap'd binary)
+    unsupported, // Windows
+    // Root without the capabilities to change identity (e.g. a container
+    // run with --cap-drop=ALL --cap-add=NET_RAW): nothing was changed, and
+    // such a root is already confined, so the caller carries on
+    not_permitted,
+    dropped: struct { uid: u32, gid: u32, sudo_user: bool },
+    failed, // a set*id call failed — the caller should refuse to continue
+};
+
+const SetgroupsSize = if (builtin.os.tag == .linux) usize else c_int;
+extern "c" fn setgroups(size: SetgroupsSize, list: ?[*]const c.gid_t) c_int;
+
+fn envId(name: [*:0]const u8) ?u32 {
+    const v = c.getenv(name) orelse return null;
+    return std.fmt.parseInt(u32, std.mem.span(v), 10) catch null;
+}
+
+pub fn dropPrivileges() DropResult {
+    if (is_windows) {
+        return .unsupported;
+    } else {
+        if (c.geteuid() != 0) return .not_root;
+
+        var uid: u32 = 65534;
+        var gid: u32 = 65534;
+        var sudo_user = false;
+        if (envId("SUDO_UID")) |u| {
+            if (u != 0) {
+                uid = u;
+                gid = envId("SUDO_GID") orelse u;
+                sudo_user = true;
+            }
+        }
+        if (!sudo_user) {
+            if (c.getpwnam("nobody")) |pw| {
+                uid = @intCast(pw.uid);
+                gid = @intCast(pw.gid);
+            }
+        }
+
+        // Order matters: supplementary groups and gid can only be changed
+        // while still root
+        const g: c.gid_t = @intCast(gid);
+        if (setgroups(1, @ptrCast(&g)) != 0) {
+            // EPERM on the first call: no CAP_SETGID, and nothing has
+            // changed yet. Any later failure leaves a half-dropped
+            // identity, which is reported as .failed.
+            return if (std.c._errno().* == @intFromEnum(posix.E.PERM)) .not_permitted else .failed;
+        }
+        if (c.setgid(@intCast(gid)) != 0) return .failed;
+        if (c.setuid(@intCast(uid)) != 0) return .failed;
+        // Verify the drop is irreversible
+        if (c.setuid(0) == 0 or c.geteuid() == 0) return .failed;
+        return .{ .dropped = .{ .uid = uid, .gid = gid, .sudo_user = sudo_user } };
+    }
+}
+
+// ARP cache on Windows via GetIpNetTable: appends the IPv4 address
+// (network byte order) of every dynamic, resolved entry to out.
+pub fn windowsArpTable(allocator: std.mem.Allocator, out: *std.ArrayList(u32)) void {
+    var size: u32 = 0;
+    if (win.GetIpNetTable(null, &size, 0) != win.ERROR_INSUFFICIENT_BUFFER or size == 0) return;
+    size += 16 * @sizeOf(win.MIB_IPNETROW); // headroom if the table grows
+    const buf = allocator.alignedAlloc(u8, .@"4", size) catch return;
+    defer allocator.free(buf);
+    if (win.GetIpNetTable(buf.ptr, &size, 0) != 0) return;
+
+    const count = std.mem.readInt(u32, buf[0..4], .little);
+    const max_rows = (buf.len - 4) / @sizeOf(win.MIB_IPNETROW);
+    const rows: [*]align(4) const win.MIB_IPNETROW = @ptrCast(@alignCast(buf[4..].ptr));
+    for (0..@min(count, max_rows)) |i| {
+        const row = rows[i];
+        if (row.type != win.MIB_IPNET_TYPE_DYNAMIC) continue;
+        if (row.phys_addr_len == 0) continue;
+        out.append(allocator, row.addr) catch return;
+    }
 }
 
 // IPv4 interface enumeration for Windows via GetIpAddrTable. Rows land in

@@ -45,9 +45,33 @@
 // with an RST (zero window) rather than FIN so nothing lingers. See
 // probe.zig; the same probe works against hosts not running this tool.
 //
-// Everything received is untrusted input: fixed caps on peers and hosts,
-// strict length checks, unknown magic/type dropped silently. Old nodes
-// drop ping/pong as unknown types, so mixing versions stays harmless.
+// Authenticated mode (--mesh-key): every message carries magic "NLHA"
+// instead of "NLH1" and ends with a 16-byte tag, HMAC-SHA256 over the
+// whole message before it (truncated). Nodes without the key drop "NLHA"
+// as an unknown magic and keyed nodes drop anything untagged or
+// mis-tagged, so a keyed mesh and an open one ignore each other.
+//
+// The tag proves a message was made by a key holder, not that it is fresh
+// or came from the address it claims: a captured message can be replayed
+// later, from a spoofed source. So in authenticated mode a sender's address
+// is only trusted after a challenge: a message from an unknown node, or
+// from a known node at a new address, triggers a ping with a fresh token
+// to that address, and the node (or address change) is accepted only when
+// a pong echoing that exact token comes back from it — which needs the key
+// and the address. Until then the message is dropped: no fast-join results
+// burst, no peer slot, no redirected probes. A keyed peer also stays alive
+// only by answering our latest ping, so replayed beacons can't keep a
+// departed node on the table. Results only ever move forward in seq, so
+// replaying an older scan can't roll a peer back. What replay still can do
+// is re-deliver a peer's current data from its own address, or make this
+// node send ≤1 challenge ping per second per (node, address) — no
+// amplification.
+//
+// Everything received is untrusted input: datagrams from outside the
+// scanned subnet and the local interfaces' subnets are
+// dropped before parsing, then fixed caps on peers and hosts, strict
+// length checks, unknown magic/type dropped silently. Old nodes drop
+// ping/pong as unknown types, so mixing versions stays harmless.
 const std = @import("std");
 const posix = std.posix;
 const common = @import("common.zig");
@@ -67,6 +91,9 @@ const StdoutWriter = common.StdoutWriter;
 pub const default_port: u16 = 47269;
 
 const protocol_magic = [4]u8{ 'N', 'L', 'H', '1' };
+const auth_magic = [4]u8{ 'N', 'L', 'H', 'A' };
+const tag_len = 16;
+const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 const header_len = 13;
 const beacon_fixed_len = header_len + 7; // + seq, host_count, hostname_len
 const results_fixed_len = header_len + 10; // + seq, total, offset, count
@@ -80,6 +107,53 @@ const entries_per_chunk = 80; // 80*16 + 23 = 1303 bytes, under typical MTU
 const recv_buf_len = 2048;
 
 pub const max_peers = 32;
+
+// A network (address + mask, host byte order) mesh traffic may come from
+pub const Network = struct {
+    addr: u32,
+    mask: u32,
+
+    pub fn fromPrefix(ip: [4]u8, mask_bits: u8) Network {
+        const mask: u32 = if (mask_bits >= 32)
+            ~@as(u32, 0)
+        else if (mask_bits == 0)
+            0
+        else
+            ~@as(u32, 0) << @intCast(32 - mask_bits);
+        return .{ .addr = ipToU32(ip) & mask, .mask = mask };
+    }
+
+    pub fn contains(self: Network, ip: u32) bool {
+        return ip & self.mask == self.addr;
+    }
+};
+pub const max_networks = 1 + 32;
+
+// Append the authentication tag over msg, rewriting its magic to
+// auth_magic first. Returns the tagged message (in out).
+pub fn sealMessage(out: []u8, msg: []const u8, key: []const u8) []const u8 {
+    @memcpy(out[0..msg.len], msg);
+    @memcpy(out[0..4], &auth_magic);
+    var tag: [Hmac.mac_length]u8 = undefined;
+    Hmac.create(&tag, out[0..msg.len], key);
+    @memcpy(out[msg.len..][0..tag_len], tag[0..tag_len]);
+    return out[0 .. msg.len + tag_len];
+}
+
+// Verify and strip the tag of an authenticated message, in place: on
+// success the returned slice is the plain message (magic restored to
+// protocol_magic); null when the tag is missing or wrong.
+pub fn openMessage(buf: []u8, key: []const u8) ?[]u8 {
+    if (buf.len < header_len + tag_len) return null;
+    if (!std.mem.eql(u8, buf[0..4], &auth_magic)) return null;
+    const body_len = buf.len - tag_len;
+    var tag: [Hmac.mac_length]u8 = undefined;
+    Hmac.create(&tag, buf[0..body_len], key);
+    const got: [tag_len]u8 = buf[body_len..][0..tag_len].*;
+    if (!std.crypto.timing_safe.eql([tag_len]u8, got, tag[0..tag_len].*)) return null;
+    @memcpy(buf[0..4], &protocol_magic);
+    return buf[0..body_len];
+}
 pub const max_hosts_per_peer = 2048;
 
 const beacon_interval_us: i64 = 2 * std.time.us_per_s;
@@ -97,6 +171,26 @@ const tcp_probe_interval_us: i64 = 3 * std.time.us_per_s;
 const tcp_probe_timeout_ms: u32 = probe.default_timeout_ms;
 
 const max_display_rows = 40;
+
+// Authenticated mode: outstanding address challenges (see top of file)
+const max_pending = max_peers;
+const challenge_resend_us: i64 = std.time.us_per_s;
+
+const Pending = struct {
+    node_id: u64,
+    addr: posix.sockaddr.in,
+    token: u64,
+    sent_us: i64,
+};
+
+fn sameAddr(a: posix.sockaddr.in, b: posix.sockaddr.in) bool {
+    return a.addr == b.addr and a.port == b.port;
+}
+
+// Wrapping "a is a later scan than b" for results seq numbers
+fn seqNewer(a: u32, b: u32) bool {
+    return @as(i32, @bitCast(a -% b)) > 0;
+}
 const max_display_observers = 6;
 
 // Sentinel in wire stats: host was discovered but produced no latency sample
@@ -371,6 +465,7 @@ const Peer = struct {
     // A ping still outstanding when the next one goes out counts as a miss.
     udp_stats: probe.ProbeStats,
     udp_ping_outstanding: bool,
+    udp_ping_token: u64, // token of the latest ping sent to this peer
 
     // This peer's gossiped link measurements: its view of its own links to
     // other nodes, and of its own --tcp-ping targets. Replaced wholesale on
@@ -468,6 +563,16 @@ pub const Mesh = struct {
     // covers hosts whose interface address falls outside the scanned range)
     bcast_addrs: [2]posix.sockaddr.in,
 
+    // Where mesh traffic may come from: the scanned subnet plus each
+    // local interface's subnet. Anything else is dropped unparsed — no
+    // fast-join reply (which would otherwise send a spoofed source ~34KB
+    // of results for one small beacon) and no peer-table slot taken.
+    allowed: [max_networks]Network,
+    allowed_count: usize,
+
+    // Shared secret for authenticated mode, null for an open mesh
+    key: ?[]const u8,
+
     // Our own results, as both a map (for rendering) and a sorted array
     // (for gossip chunking)
     seq: u32,
@@ -481,9 +586,27 @@ pub const Mesh = struct {
     last_gossip_us: i64,
     last_render_us: i64,
     last_countdown_s: i64, // rescan countdown shown by the last render, -1 = none
+
+    // Authenticated mode: senders awaiting an address challenge
+    pending: [max_pending]Pending,
+    pending_count: usize,
     dirty: bool,
 
-    pub fn init(allocator: std.mem.Allocator, port: u16, subnet: [4]u8, mask_bits: u8, tcp_targets: []const probe.TcpTarget) !Mesh {
+    pub const Options = struct {
+        port: u16 = default_port,
+        subnet: [4]u8,
+        mask_bits: u8,
+        tcp_targets: []const probe.TcpTarget = &.{},
+        // Extra networks to accept mesh traffic from (local interfaces)
+        local_networks: []const Network = &.{},
+        key: ?[]const u8 = null,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, opts: Options) !Mesh {
+        const port = opts.port;
+        const subnet = opts.subnet;
+        const mask_bits = opts.mask_bits;
+        const tcp_targets = opts.tcp_targets;
         plat.netInit();
         const sock = plat.openSocket(plat.AF_INET, plat.SOCK_DGRAM, 0);
         if (!plat.isValidSocket(sock)) return error.MeshSocketFailed;
@@ -558,6 +681,15 @@ pub const Mesh = struct {
         var node_id = splitmix64(@as(u64, @bitCast(common.wallMicros())));
         node_id ^= splitmix64(@as(u64, @bitCast(monotonicMicros())) ^ (@as(u64, pid) << 32));
 
+        var allowed: [max_networks]Network = undefined;
+        allowed[0] = Network.fromPrefix(subnet, mask_bits);
+        var allowed_count: usize = 1;
+        for (opts.local_networks) |n| {
+            if (allowed_count >= max_networks) break;
+            allowed[allowed_count] = n;
+            allowed_count += 1;
+        }
+
         var probes = ProbeShared{};
         probes.extra_count = @min(tcp_targets.len, probe.max_targets);
         for (tcp_targets[0..probes.extra_count], 0..) |t, i| probes.extras[i] = t;
@@ -585,6 +717,9 @@ pub const Mesh = struct {
                     .addr = std.mem.bytesToValue(u32, &limited_bcast),
                 },
             },
+            .allowed = allowed,
+            .allowed_count = allowed_count,
+            .key = opts.key,
             .seq = 0,
             .local_hosts = std.AutoHashMap(u32, HostStats).init(allocator),
             .local_entries = .empty,
@@ -594,6 +729,8 @@ pub const Mesh = struct {
             .last_gossip_us = 0,
             .last_render_us = 0,
             .last_countdown_s = -1,
+            .pending = undefined,
+            .pending_count = 0,
             .dirty = false,
         };
     }
@@ -727,7 +864,17 @@ pub const Mesh = struct {
     fn sendDatagram(self: *Mesh, data: []const u8, dest: *const posix.sockaddr.in) void {
         // Errors (buffer full, unreachable) are ignored: beacons and gossip
         // repeat on an interval, so a dropped datagram heals itself
-        _ = plat.sendto(self.sock, data, dest, @sizeOf(posix.sockaddr.in));
+        var sealed: [recv_buf_len]u8 = undefined;
+        const msg = if (self.key) |k| sealMessage(&sealed, data, k) else data;
+        _ = plat.sendto(self.sock, msg, dest, @sizeOf(posix.sockaddr.in));
+    }
+
+    fn sourceAllowed(self: *const Mesh, addr_be: u32) bool {
+        const ip = ipToU32(@bitCast(addr_be));
+        for (self.allowed[0..self.allowed_count]) |n| {
+            if (n.contains(ip)) return true;
+        }
+        return false;
     }
 
     fn sendBeacons(self: *Mesh) void {
@@ -778,7 +925,8 @@ pub const Mesh = struct {
             p.udp_ping_outstanding = true;
             // Fresh timestamp per send so queueing behind earlier sends in
             // this loop doesn't inflate the sample
-            const msg = encodePing(&buf, self.node_id, @bitCast(monotonicMicros()));
+            p.udp_ping_token = @bitCast(monotonicMicros());
+            const msg = encodePing(&buf, self.node_id, p.udp_ping_token);
             self.sendDatagram(msg, &p.addr);
         }
     }
@@ -861,6 +1009,7 @@ pub const Mesh = struct {
             .hosts = std.AutoHashMap(u32, HostStats).init(self.allocator),
             .udp_stats = .{},
             .udp_ping_outstanding = false,
+            .udp_ping_token = 0,
             .links = undefined,
             .link_count = 0,
             .remote_targets = undefined,
@@ -874,11 +1023,62 @@ pub const Mesh = struct {
         return &self.peers.items[self.peers.items.len - 1];
     }
 
+    // The peer a message speaks for. An open mesh trusts the source address
+    // as given. An authenticated one only for a known peer at its known
+    // address; anything else is challenged and the message dropped.
+    fn acceptPeer(self: *Mesh, node_id: u64, src: *const posix.sockaddr.in, now: i64) ?*Peer {
+        if (self.key == null) return self.obtainPeer(node_id, src, now);
+        if (self.findPeer(node_id)) |p| {
+            // Not refreshing last_seen here: a replayed beacon could keep a
+            // departed peer alive forever. Keyed peers stay alive by
+            // answering our pings (see the pong handler).
+            if (sameAddr(p.addr, src.*)) return p;
+        }
+        self.challenge(node_id, src, now);
+        return null;
+    }
+
+    // Ping (node_id, src) with a fresh token, at most once a second each
+    fn challenge(self: *Mesh, node_id: u64, src: *const posix.sockaddr.in, now: i64) void {
+        var slot: ?*Pending = null;
+        for (self.pending[0..self.pending_count]) |*q| {
+            if (q.node_id == node_id and sameAddr(q.addr, src.*)) {
+                if (now - q.sent_us < challenge_resend_us) return;
+                slot = q;
+                break;
+            }
+        }
+        if (slot == null) {
+            if (self.pending_count >= max_pending) return;
+            slot = &self.pending[self.pending_count];
+            self.pending_count += 1;
+        }
+        const q = slot.?;
+        q.* = .{ .node_id = node_id, .addr = src.*, .token = @bitCast(monotonicMicros()), .sent_us = now };
+        var buf: [ping_len]u8 = undefined;
+        self.sendDatagram(encodePing(&buf, self.node_id, q.token), src);
+    }
+
+    // A pong answering an outstanding challenge, from the challenged
+    // address with the exact token: accept the node at that address
+    fn completeChallenge(self: *Mesh, node_id: u64, token: u64, src: *const posix.sockaddr.in, now: i64) void {
+        for (self.pending[0..self.pending_count], 0..) |q, i| {
+            if (q.node_id != node_id or q.token != token or !sameAddr(q.addr, src.*)) continue;
+            self.pending[i] = self.pending[self.pending_count - 1];
+            self.pending_count -= 1;
+            if (now - q.sent_us > udp_ping_max_rtt_us) return;
+            // New peer (fast join follows) or a known one that moved
+            _ = self.obtainPeer(node_id, src, now);
+            self.dirty = true;
+            return;
+        }
+    }
+
     fn handleMessage(self: *Mesh, parsed: Parsed, src: *const posix.sockaddr.in, now: i64) void {
         switch (parsed) {
             .beacon => |b| {
                 if (b.node_id == self.node_id) return; // our own broadcast
-                const peer = self.obtainPeer(b.node_id, src, now) orelse return;
+                const peer = self.acceptPeer(b.node_id, src, now) orelse return;
                 if (!std.mem.eql(u8, peer.name(), b.hostname)) {
                     @memcpy(peer.hostname[0..b.hostname.len], b.hostname);
                     peer.hostname_len = @intCast(b.hostname.len);
@@ -887,8 +1087,11 @@ pub const Mesh = struct {
             },
             .results => |r| {
                 if (r.node_id == self.node_id) return;
-                const peer = self.obtainPeer(r.node_id, src, now) orelse return;
+                const peer = self.acceptPeer(r.node_id, src, now) orelse return;
                 if (peer.results_seq != r.seq) {
+                    // Only ever move forward: an older scan (reordered, or
+                    // replayed) must not replace newer data
+                    if (peer.last_results_us != 0 and !seqNewer(r.seq, peer.results_seq)) return;
                     // A new scan from this peer supersedes the old one; the
                     // age shown for this column dates from here, not from
                     // re-gossips of the same data
@@ -914,7 +1117,14 @@ pub const Mesh = struct {
             },
             .pong => |p| {
                 if (p.node_id == self.node_id) return;
+                if (self.key != null) self.completeChallenge(p.node_id, p.token, src, now);
                 const peer = self.findPeer(p.node_id) orelse return;
+                if (self.key != null) {
+                    // Only a pong to our latest ping, from the peer's own
+                    // address, proves it is still there
+                    if (!sameAddr(peer.addr, src.*) or p.token != peer.udp_ping_token) return;
+                    peer.last_seen_us = now;
+                }
                 // The token is our own monotonic send time; sanity-bound it
                 // so a garbled or replayed pong can't record a junk RTT.
                 // (A LAN peer could lie here, same trust level as gossip.)
@@ -926,7 +1136,7 @@ pub const Mesh = struct {
             },
             .links => |l| {
                 if (l.node_id == self.node_id) return;
-                const peer = self.obtainPeer(l.node_id, src, now) orelse return;
+                const peer = self.acceptPeer(l.node_id, src, now) orelse return;
                 // Full snapshot: replace what we held (parse already capped
                 // both counts at the storage sizes)
                 var i: usize = 0;
@@ -949,6 +1159,16 @@ pub const Mesh = struct {
     }
 
     fn expirePeers(self: *Mesh, now: i64) void {
+        var j: usize = 0;
+        while (j < self.pending_count) {
+            if (now - self.pending[j].sent_us > udp_ping_max_rtt_us) {
+                self.pending[j] = self.pending[self.pending_count - 1];
+                self.pending_count -= 1;
+            } else {
+                j += 1;
+            }
+        }
+
         var i: usize = 0;
         while (i < self.peers.items.len) {
             if (now - self.peers.items[i].last_seen_us > peer_timeout_us) {
@@ -969,7 +1189,10 @@ pub const Mesh = struct {
             const rc = plat.recvfrom(self.sock, &buf, &src, &src_len);
             if (rc <= 0) break;
             if (src.family != posix.AF.INET) continue;
-            const parsed = parseMessage(buf[0..@intCast(rc)]) orelse continue;
+            if (!self.sourceAllowed(src.addr)) continue;
+            var msg: []u8 = buf[0..@intCast(rc)];
+            if (self.key) |k| msg = openMessage(msg, k) orelse continue;
+            const parsed = parseMessage(msg) orelse continue;
             self.handleMessage(parsed, &src, now);
         }
     }
@@ -1097,23 +1320,27 @@ pub const Mesh = struct {
     fn render(self: *Mesh, stdout: StdoutWriter, now: i64, next_scan_at: ?i64) void {
         if (!common.stdout_is_tty) {
             // Piped: each render is an appended plain-text snapshot
-            self.renderBody(stdout, now, next_scan_at);
+            self.renderBody(stdout, now, next_scan_at, null);
             return;
         }
         // TTY: compose the frame off-screen, then overwrite the previous
         // frame in place and emit it as one single write — never
         // clear-then-redraw, which flashes a blank screen between frames
         // (see common.encodeFrame)
+        const size = plat.terminalSize();
         var body: std.Io.Writer.Allocating = .init(self.allocator);
         defer body.deinit();
-        self.renderBody(&body.writer, now, next_scan_at);
+        self.renderBody(&body.writer, now, next_scan_at, size);
         var frame: std.Io.Writer.Allocating = .init(self.allocator);
         defer frame.deinit();
-        common.encodeFrame(&frame.writer, body.written()) catch return;
+        common.encodeFrame(&frame.writer, body.written(), size) catch return;
         stdout.writeAll(frame.written()) catch {};
     }
 
-    fn renderBody(self: *Mesh, stdout: StdoutWriter, now: i64, next_scan_at: ?i64) void {
+    // size: the terminal's, when the frame must fit a window — observer
+    // columns and matrix rows are then reduced to fit (anything still too
+    // big is clipped by encodeFrame)
+    fn renderBody(self: *Mesh, stdout: StdoutWriter, now: i64, next_scan_at: ?i64, size: ?plat.TermSize) void {
         const reset = common.sgr("\x1b[0m");
         const bold = common.sgr("\x1b[1m");
         const gray = common.sgr("\x1b[90m");
@@ -1137,7 +1364,8 @@ pub const Mesh = struct {
             observers[num_obs] = makeObserver(label_text, p.node_id, &p.hosts, age);
             num_obs += 1;
         }
-        const shown_obs = @min(num_obs, max_display_observers);
+        const shown_obs = @min(num_obs, maxObserverColumns(size, col_width, label_width));
+        const max_rows: usize = if (size) |sz| std.math.clamp(@as(usize, sz.rows) -| 16, 5, max_display_rows) else max_display_rows;
 
         // Row set: every host any observer has measured
         var row_set = std.AutoHashMap(u32, void).init(self.allocator);
@@ -1196,7 +1424,7 @@ pub const Mesh = struct {
         stdout.print("\n", .{}) catch {};
 
         // Matrix body
-        const shown_rows = @min(rows.items.len, max_display_rows);
+        const shown_rows = @min(rows.items.len, max_rows);
         var uneven_count: usize = 0;
         for (rows.items[0..shown_rows]) |ip| {
             var ip_buf: [16]u8 = undefined;
@@ -1236,6 +1464,17 @@ pub const Mesh = struct {
 
         self.renderLinks(stdout, observers[0..num_obs], shown_obs);
         self.renderInsights(stdout, observers[0..num_obs], rows.items, uneven_count);
+    }
+
+    // How many observer columns fit: 2-column indent, the row label, then
+    // col_width per observer, keeping room for the "◀ uneven" / "+N more"
+    // tail. Always at least one (self).
+    fn maxObserverColumns(size: ?plat.TermSize, col_width: usize, label_width: usize) usize {
+        const sz = size orelse return max_display_observers;
+        const fixed = 2 + label_width + 9;
+        const cols: usize = sz.cols;
+        if (cols <= fixed + col_width) return 1;
+        return std.math.clamp((cols - fixed) / col_width, 1, max_display_observers);
     }
 
     const Link = struct { udp: ?u64, tcp: ?u64, refused: bool };
@@ -1647,6 +1886,130 @@ test "parseMessage rejects malformed datagrams" {
     @memcpy(&overrun, rmsg[0 .. results_fixed_len + entry_len]);
     std.mem.writeInt(u16, overrun[19..21], 4, .little); // offset 4 of total 4
     try testing.expect(parseMessage(&overrun) == null);
+}
+
+test "sealMessage / openMessage round-trip and reject tampering" {
+    var plain_buf: [ping_len]u8 = undefined;
+    const plain = encodePing(&plain_buf, 7, 99);
+
+    var sealed_buf: [ping_len + tag_len]u8 = undefined;
+    const sealed = sealMessage(&sealed_buf, plain, "secret");
+    try testing.expectEqual(plain.len + tag_len, sealed.len);
+    // Unkeyed nodes see an unknown magic and drop it
+    try testing.expect(parseMessage(sealed) == null);
+
+    var copy: [ping_len + tag_len]u8 = undefined;
+    @memcpy(&copy, sealed);
+    const opened = openMessage(&copy, "secret").?;
+    try testing.expectEqualSlices(u8, plain, opened);
+    try testing.expectEqual(@as(u64, 99), parseMessage(opened).?.ping.token);
+
+    // Wrong key
+    @memcpy(&copy, sealed);
+    try testing.expect(openMessage(&copy, "other") == null);
+    // Flipped payload bit
+    @memcpy(&copy, sealed);
+    copy[15] ^= 1;
+    try testing.expect(openMessage(&copy, "secret") == null);
+    // Untagged message
+    var raw: [ping_len]u8 = undefined;
+    @memcpy(&raw, plain);
+    try testing.expect(openMessage(&raw, "secret") == null);
+}
+
+fn testAddr(last: u8, port: u16) posix.sockaddr.in {
+    const ip = [4]u8{ 127, 0, 0, last };
+    return .{ .family = posix.AF.INET, .port = std.mem.nativeToBig(u16, port), .addr = std.mem.bytesToValue(u32, &ip) };
+}
+
+fn testBeacon(node_id: u64) Parsed {
+    return .{ .beacon = .{ .node_id = node_id, .seq = 1, .host_count = 0, .hostname = "peer" } };
+}
+
+test "authenticated mesh accepts a sender only after it answers a challenge" {
+    var mesh = try Mesh.init(testing.allocator, .{ .port = 0, .subnet = .{ 127, 0, 0, 0 }, .mask_bits = 8, .key = "k" });
+    defer mesh.deinit();
+    const a = testAddr(2, 40000);
+    const b = testAddr(3, 40000);
+    const now = monotonicMicros();
+
+    // A (possibly replayed) beacon only starts a challenge
+    mesh.handleMessage(testBeacon(7), &a, now);
+    try testing.expectEqual(@as(usize, 0), mesh.peers.items.len);
+    try testing.expectEqual(@as(usize, 1), mesh.pending_count);
+    const token = mesh.pending[0].token;
+
+    // Wrong token, or the right token from another address: rejected
+    mesh.handleMessage(.{ .pong = .{ .node_id = 7, .token = token +% 1 } }, &a, now);
+    mesh.handleMessage(.{ .pong = .{ .node_id = 7, .token = token } }, &b, now);
+    try testing.expectEqual(@as(usize, 0), mesh.peers.items.len);
+
+    // The challenged address echoing the token: accepted there
+    mesh.handleMessage(.{ .pong = .{ .node_id = 7, .token = token } }, &a, now);
+    try testing.expectEqual(@as(usize, 1), mesh.peers.items.len);
+    try testing.expect(sameAddr(mesh.peers.items[0].addr, a));
+    try testing.expectEqual(@as(usize, 0), mesh.pending_count);
+
+    // A beacon replayed from the peer's own address doesn't keep it alive;
+    // only a pong to our latest ping does
+    const seen = mesh.peers.items[0].last_seen_us;
+    mesh.handleMessage(testBeacon(7), &a, now + 5 * std.time.us_per_s);
+    try testing.expectEqual(seen, mesh.peers.items[0].last_seen_us);
+    mesh.peers.items[0].udp_ping_token = 1234;
+    mesh.handleMessage(.{ .pong = .{ .node_id = 7, .token = 1233 } }, &a, now + 6 * std.time.us_per_s);
+    try testing.expectEqual(seen, mesh.peers.items[0].last_seen_us);
+    mesh.handleMessage(.{ .pong = .{ .node_id = 7, .token = 1234 } }, &a, now + 6 * std.time.us_per_s);
+    try testing.expectEqual(now + 6 * std.time.us_per_s, mesh.peers.items[0].last_seen_us);
+
+    // A beacon replayed from elsewhere doesn't move the peer
+    mesh.handleMessage(testBeacon(7), &b, now);
+    try testing.expect(sameAddr(mesh.peers.items[0].addr, a));
+    try testing.expectEqual(@as(usize, 1), mesh.pending_count);
+
+    // Results only move forward in seq
+    var entry_buf: [entry_len]u8 = undefined;
+    const e = Entry{ .ip = 1, .stats = .{ .min_us = 1, .avg_us = 2, .max_us = 3 } };
+    var rbuf: [results_fixed_len + entry_len]u8 = undefined;
+    _ = encodeResultsChunk(&rbuf, 7, 5, 1, 0, &.{e});
+    @memcpy(&entry_buf, rbuf[results_fixed_len..][0..entry_len]);
+    mesh.handleMessage(.{ .results = .{ .node_id = 7, .seq = 5, .total = 1, .offset = 0, .entries = &entry_buf } }, &a, now);
+    try testing.expectEqual(@as(u32, 5), mesh.peers.items[0].results_seq);
+    mesh.handleMessage(.{ .results = .{ .node_id = 7, .seq = 4, .total = 1, .offset = 0, .entries = &entry_buf } }, &a, now);
+    try testing.expectEqual(@as(u32, 5), mesh.peers.items[0].results_seq);
+    mesh.handleMessage(.{ .results = .{ .node_id = 7, .seq = 6, .total = 1, .offset = 0, .entries = &entry_buf } }, &a, now);
+    try testing.expectEqual(@as(u32, 6), mesh.peers.items[0].results_seq);
+}
+
+test "open mesh accepts senders directly" {
+    var mesh = try Mesh.init(testing.allocator, .{ .port = 0, .subnet = .{ 127, 0, 0, 0 }, .mask_bits = 8 });
+    defer mesh.deinit();
+    const a = testAddr(2, 40000);
+    mesh.handleMessage(testBeacon(9), &a, monotonicMicros());
+    try testing.expectEqual(@as(usize, 1), mesh.peers.items.len);
+    try testing.expectEqual(@as(usize, 0), mesh.pending_count);
+}
+
+test "seqNewer wraps" {
+    try testing.expect(seqNewer(2, 1));
+    try testing.expect(!seqNewer(1, 2));
+    try testing.expect(!seqNewer(3, 3));
+    try testing.expect(seqNewer(0, 0xFFFF_FFFF));
+}
+
+test "Network.contains and sourceAllowed-style matching" {
+    const n = Network.fromPrefix(.{ 192, 168, 1, 77 }, 24);
+    try testing.expect(n.contains(ipToU32(.{ 192, 168, 1, 5 })));
+    try testing.expect(!n.contains(ipToU32(.{ 192, 168, 2, 5 })));
+    const host = Network.fromPrefix(.{ 10, 0, 0, 1 }, 32);
+    try testing.expect(host.contains(ipToU32(.{ 10, 0, 0, 1 })));
+    try testing.expect(!host.contains(ipToU32(.{ 10, 0, 0, 2 })));
+}
+
+test "maxObserverColumns fits the terminal width" {
+    try testing.expectEqual(@as(usize, max_display_observers), Mesh.maxObserverColumns(null, 13, 17));
+    try testing.expectEqual(@as(usize, 1), Mesh.maxObserverColumns(.{ .rows = 24, .cols = 40 }, 13, 17));
+    try testing.expectEqual(@as(usize, 4), Mesh.maxObserverColumns(.{ .rows = 24, .cols = 80 }, 13, 17));
+    try testing.expectEqual(@as(usize, max_display_observers), Mesh.maxObserverColumns(.{ .rows = 24, .cols = 200 }, 13, 17));
 }
 
 test "spreadIsUneven requires both ratio and absolute gap" {

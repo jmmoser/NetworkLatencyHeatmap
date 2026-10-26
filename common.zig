@@ -51,6 +51,19 @@ pub const PingResult = struct {
     latency_us: ?u64, // microseconds, null if timeout (min latency)
     latency_avg: ?u64, // average latency
     latency_max: ?u64, // max latency
+    stddev_us: ?u64 = null, // jitter: standard deviation of the samples
+    sent: u8 = 0, // latency-phase pings sent
+    received: u8 = 0, // latency-phase replies received
+    // False for hosts found only in the neighbor (ARP) table: present on
+    // the segment but not answering ICMP echo, so no latency samples
+    icmp: bool = true,
+
+    // Latency-phase packet loss in percent, null when nothing was sent
+    pub fn lossPct(self: PingResult) ?f64 {
+        if (self.sent == 0) return null;
+        const lost: f64 = @floatFromInt(self.sent - @min(self.received, self.sent));
+        return lost / @as(f64, @floatFromInt(self.sent)) * 100.0;
+    }
 };
 
 // Platform-agnostic event poller for socket readiness
@@ -249,49 +262,97 @@ pub fn formatLatency(latency_us: ?u64, buf: []u8) []const u8 {
 // atomically. The cursor is hidden while it jumps; hide and show travel
 // inside the same frame, so it never visibly blinks out. The caller
 // emits the encoded frame as a single write.
-pub fn encodeFrame(out: *std.Io.Writer, body: []const u8) !void {
+//
+// Overwriting in place only works while the frame fits the window: a
+// line wider than the terminal wraps onto a second row and a frame taller
+// than it scrolls, after which homing the cursor no longer lands on the
+// frame's first line and every redraw leaves a stale copy behind. Given
+// the terminal size, lines are clipped to cols-1 columns and the frame to
+// rows-1 lines (the final newline must not scroll), with a note in place
+// of the cut-off tail.
+pub fn encodeFrame(out: *std.Io.Writer, body: []const u8, size: ?plat.TermSize) !void {
     try out.writeAll("\x1b[?2026h\x1b[?25l\x1b[H");
+
+    const max_cols: usize = if (size) |sz| @max(@as(usize, sz.cols), 2) - 1 else std.math.maxInt(usize);
+    // Newline-terminated lines that fit without scrolling (0 on a 1-row
+    // terminal, where only an unterminated note line can be shown)
+    const max_lines: usize = if (size) |sz| @as(usize, sz.rows) -| 1 else std.math.maxInt(usize);
+    const total_lines = std.mem.count(u8, body, "\n") + @intFromBool(body.len > 0 and body[body.len - 1] != '\n');
+    const keep_lines = if (total_lines > max_lines) max_lines -| 1 else total_lines;
+
     var rest = body;
-    while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
-        try out.writeAll(rest[0..nl]);
+    var line_no: usize = 0;
+    while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| : (line_no += 1) {
+        if (line_no >= keep_lines) break;
+        try writeClipped(out, rest[0..nl], max_cols);
         try out.writeAll("\x1b[K\n");
         rest = rest[nl + 1 ..];
+    } else {
+        if (line_no < keep_lines) try writeClipped(out, rest, max_cols);
     }
-    try out.writeAll(rest);
+    if (total_lines > keep_lines) {
+        var note_buf: [96]u8 = undefined;
+        const note = std.fmt.bufPrint(&note_buf, "{s}  ... {d} more lines; enlarge the terminal to see them{s}", .{
+            sgr("\x1b[90m"), total_lines - keep_lines, sgr("\x1b[0m"),
+        }) catch "";
+        try writeClipped(out, note, max_cols);
+        try out.writeAll(if (max_lines > 0) "\x1b[K\n" else "\x1b[K");
+    }
     try out.writeAll("\x1b[0J\x1b[?25h\x1b[?2026l");
 }
 
+// Byte length of the UTF-8 sequence starting with `byte` (1 for ASCII and
+// stray continuation bytes)
+fn utf8Len(byte: u8) usize {
+    if (byte < 0xC0) return 1;
+    if (byte < 0xE0) return 2;
+    if (byte < 0xF0) return 3;
+    return 4;
+}
+
+// Byte length of the ANSI CSI sequence at s[i..] (0 if there is none)
+fn csiLen(s: []const u8, i: usize) usize {
+    if (s[i] != 0x1b or i + 1 >= s.len or s[i + 1] != '[') return 0;
+    var j = i + 2;
+    // Skip until the final byte of the sequence (letter)
+    while (j < s.len and (s[j] < 0x40 or s[j] > 0x7E)) : (j += 1) {}
+    if (j < s.len) j += 1;
+    return j - i;
+}
+
+// Write `line` showing at most max_cols visible columns. Escape sequences
+// past the cut are still written, so a trailing color reset still applies.
+fn writeClipped(out: *std.Io.Writer, line: []const u8, max_cols: usize) !void {
+    if (displayWidth(line) <= max_cols) return out.writeAll(line);
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) {
+        const esc = csiLen(line, i);
+        if (esc > 0) {
+            try out.writeAll(line[i..][0..esc]);
+            i += esc;
+            continue;
+        }
+        const n = @min(utf8Len(line[i]), line.len - i);
+        if (width < max_cols) try out.writeAll(line[i..][0..n]);
+        width += 1;
+        i += n;
+    }
+}
+
 pub fn displayWidth(s: []const u8) usize {
-    // Count display width, accounting for multi-byte UTF-8 and ANSI escape sequences
+    // Count display width, accounting for multi-byte UTF-8 and ANSI escape
+    // sequences (every character used here is one column wide)
     var width: usize = 0;
     var i: usize = 0;
     while (i < s.len) {
-        const byte = s[i];
-        // Skip ANSI escape sequences (e.g., \x1b[32m)
-        if (byte == 0x1b and i + 1 < s.len and s[i + 1] == '[') {
-            i += 2;
-            // Skip until we hit the final byte of the sequence (letter)
-            while (i < s.len and (s[i] < 0x40 or s[i] > 0x7E)) : (i += 1) {}
-            if (i < s.len) i += 1; // Skip the final letter
+        const esc = csiLen(s, i);
+        if (esc > 0) {
+            i += esc;
             continue;
         }
-        if (byte < 0x80) {
-            // ASCII
-            width += 1;
-            i += 1;
-        } else if (byte < 0xE0) {
-            // 2-byte UTF-8 (includes µ)
-            width += 1;
-            i += 2;
-        } else if (byte < 0xF0) {
-            // 3-byte UTF-8
-            width += 1;
-            i += 3;
-        } else {
-            // 4-byte UTF-8
-            width += 1;
-            i += 4;
-        }
+        width += 1;
+        i += utf8Len(s[i]);
     }
     return width;
 }
@@ -328,7 +389,7 @@ test "sgr and latencyToColor collapse to nothing when color is disabled" {
 test "encodeFrame overwrites in place: sync wrap, EL per line, ED at end" {
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try encodeFrame(&w, "ab\ncd\n");
+    try encodeFrame(&w, "ab\ncd\n", null);
     try testing.expectEqualStrings(
         "\x1b[?2026h\x1b[?25l\x1b[H" ++ "ab\x1b[K\ncd\x1b[K\n" ++ "\x1b[0J\x1b[?25h\x1b[?2026l",
         w.buffered(),
@@ -340,11 +401,61 @@ test "encodeFrame overwrites in place: sync wrap, EL per line, ED at end" {
 test "encodeFrame handles a body without a trailing newline" {
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try encodeFrame(&w, "tail");
+    try encodeFrame(&w, "tail", null);
     try testing.expectEqualStrings(
         "\x1b[?2026h\x1b[?25l\x1b[H" ++ "tail" ++ "\x1b[0J\x1b[?25h\x1b[?2026l",
         w.buffered(),
     );
+}
+
+test "encodeFrame clips wide lines but keeps their escape sequences" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try encodeFrame(&w, "\x1b[92mabcdef\x1b[0m\nxy\n", .{ .rows = 10, .cols = 4 });
+    try testing.expectEqualStrings(
+        "\x1b[?2026h\x1b[?25l\x1b[H" ++ "\x1b[92mabc\x1b[0m\x1b[K\nxy\x1b[K\n" ++ "\x1b[0J\x1b[?25h\x1b[?2026l",
+        w.buffered(),
+    );
+}
+
+test "encodeFrame cuts a frame taller than the terminal, leaving a note" {
+    const saved = color_enabled;
+    defer color_enabled = saved;
+    color_enabled = false;
+
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    // 5 lines into a 4-row terminal: 3 rows of frame (2 lines + note), so
+    // the final newline never scrolls
+    try encodeFrame(&w, "1\n2\n3\n4\n5\n", .{ .rows = 4, .cols = 80 });
+    const got = w.buffered();
+    try testing.expect(std.mem.startsWith(u8, got, "\x1b[?2026h\x1b[?25l\x1b[H1\x1b[K\n2\x1b[K\n  ... 3 more lines"));
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, got, "\n"));
+    try testing.expect(std.mem.endsWith(u8, got, "\x1b[K\n\x1b[0J\x1b[?25h\x1b[?2026l"));
+}
+
+test "encodeFrame never ends a 1-row frame with a newline" {
+    const saved = color_enabled;
+    defer color_enabled = saved;
+    color_enabled = false;
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try encodeFrame(&w, "1\n2\n", .{ .rows = 1, .cols = 80 });
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, w.buffered(), "\n"));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "2 more lines") != null);
+
+    w = std.Io.Writer.fixed(&buf);
+    try encodeFrame(&w, "1\n2\n", .{ .rows = 2, .cols = 80 });
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "\n"));
+}
+
+test "PingResult.lossPct" {
+    var r = PingResult{ .ip = .{ 1, 2, 3, 4 }, .latency_us = null, .latency_avg = null, .latency_max = null };
+    try testing.expectEqual(@as(?f64, null), r.lossPct());
+    r.sent = 4;
+    r.received = 3;
+    try testing.expectEqual(@as(?f64, 25.0), r.lossPct());
 }
 
 test "monotonicMicros is nondecreasing" {
